@@ -1,0 +1,43 @@
+@import "tailwindcss";
+
+@theme {
+  /* Backgrounds */
+  --color-onyx: #15141A;
+  --color-onyx-dark: #131317;
+  --color-carbon: #131819;
+  --color-jet-black: #252B2F;
+  --color-shadow-grey: #201F26;
+
+  /* Accents */
+  --color-emerald: #22DC95;
+  --color-dark-emerald: #156647;
+
+  /* Text & Borders */
+  --color-snow: #F9F9F9;
+  --color-granite: #9F9DA1;
+}
+
+/* Global Reset for the dark theme */
+body {
+  background-color: var(--color-onyx-dark);
+  color: var(--color-snow);
+  font-family: Arial, Helvetica, sans-serif;
+}
+
+/* Custom Scrollbar to match the dark UI */
+::-webkit-scrollbar {
+  width: 8px;
+}
+
+::-webkit-scrollbar-track {
+  background: var(--color-onyx-dark);
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--color-jet-black);
+  border-radius: 4px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: var(--color-granite);
+}
