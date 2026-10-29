@@ -9,8 +9,11 @@ from database import init_db
 from monitor import run_monitor
 
 
-HOST = "127.0.0.1"
-PORT = 8000
+import os
+HOST = "0.0.0.0"
+PORT = int(os.getenv("PORT", 8000))
+
+
 MONITOR_RETRY_SECONDS = 5
 
 
