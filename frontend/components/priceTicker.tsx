@@ -24,13 +24,17 @@ export function PriceTicker({
     const targetToken = action === "SELL" ? buyToken : sellToken;
     const market = `${targetToken}-CC`;
 
+    // Determine the API and WebSocket URLs dynamically
+    const apiUrl = "https://smart-trade-production-44e4.up.railway.app/api";
+const wsUrl = "wss://smart-trade-production-44e4.up.railway.app";
+
     // 1. Subscribe to the backend
-    fetch(`http://127.0.0.1:8000/api/subscribe?market=${market}`, { method: "POST" }).catch(console.error);
+    fetch(`${apiUrl}/subscribe?market=${market}`, { method: "POST" }).catch(console.error);
 
     // 2. Fetch 24h Graph Data
     const fetchHistory = async () => {
       try {
-        const res = await fetch(`http://127.0.0.1:8000/api/history?sell=${targetToken}&buy=CC`);
+        const res = await fetch(`${apiUrl}/history?sell=${targetToken}&buy=CC`);
         const data = await res.json();
         setHistory(data);
       } catch (error) {
@@ -42,7 +46,7 @@ export function PriceTicker({
     // 3. Polling Fallback
     const fetchPrices = async () => {
       try {
-        const res = await fetch(`http://127.0.0.1:8000/api/price?sell=${targetToken}&buy=CC`);
+        const res = await fetch(`${apiUrl}/price?sell=${targetToken}&buy=CC`);
         const data = await res.json();
         if (data.price && data.price !== "0") {
           const newPrice = parseFloat(data.price);
@@ -58,7 +62,7 @@ export function PriceTicker({
     const interval = setInterval(fetchPrices, 5000);
 
     // 4. WebSocket for instant updates
-    const ws = new WebSocket("ws://127.0.0.1:8000/ws/prices");
+    const ws = new WebSocket(`${wsUrl}/ws/prices`);
 
     ws.onmessage = (event) => {
       try {

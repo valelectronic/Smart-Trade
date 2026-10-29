@@ -8,14 +8,18 @@ export function MarketBar() {
   const [ccPrice, setCcPrice] = useState<number | null>(null);
 
   useEffect(() => {
+    // Determine the API and WebSocket URLs dynamically
+    const apiUrl = "https://smart-trade-production-44e4.up.railway.app/api";
+const wsUrl = "wss://smart-trade-production-44e4.up.railway.app";
+
     // Polling fallback (ensures prices always update)
     const fetchPrices = async () => {
       try {
-        const btcRes = await fetch("http://127.0.0.1:8000/api/price?sell=BTC&buy=USDC");
+        const btcRes = await fetch(`${apiUrl}/price?sell=BTC&buy=USDC`);
         const btcData = await btcRes.json();
         if (btcData.price && btcData.price !== "0") setBtcPrice(parseFloat(btcData.price));
 
-        const ccRes = await fetch("http://127.0.0.1:8000/api/price?sell=CC&buy=USDC");
+        const ccRes = await fetch(`${apiUrl}/price?sell=CC&buy=USDC`);
         const ccData = await ccRes.json();
         if (ccData.price && ccData.price !== "0") setCcPrice(parseFloat(ccData.price));
       } catch (err) {}
@@ -25,7 +29,7 @@ export function MarketBar() {
     const interval = setInterval(fetchPrices, 5000);
 
     // WebSocket for instant updates
-    const ws = new WebSocket("ws://127.0.0.1:8000/ws/prices");
+    const ws = new WebSocket(`${wsUrl}/ws/prices`);
 
     ws.onmessage = (event) => {
       try {
