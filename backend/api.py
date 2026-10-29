@@ -39,10 +39,11 @@ app.add_middleware(
     allow_origins=[
         "http://localhost:3000",
         "http://127.0.0.1:3000",
+        "https://frontend-hazel-iota-70.vercel.app",
     ],
     allow_credentials=False,
-    allow_methods=["GET", "POST", "DELETE"],
-    allow_headers=["Content-Type", "Authorization"],
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 
@@ -68,15 +69,9 @@ class OrderCreate(BaseModel):
         if sell_token == buy_token:
             raise ValueError("sell_token and buy_token must differ")
 
-        # FORCE THE CORRECT DIRECTION
         safe_direction = "BELOW" if self.action == "BUY" else "ABOVE"
 
-        # --- THE FIX: ALWAYS CHECK THE TARGET TOKEN'S PRICE ---
-        # If BUY, we are buying the buy_token. Target is buy_token.
-        # If SELL, we are selling the sell_token. Target is sell_token.
         target_token = buy_token if self.action == "BUY" else sell_token
-        
-        # The market we monitor for this target (e.g., NEOPRIME-CC)
         target_market = f"{target_token}-CC"
         
         prices_file = Path(__file__).parent / "prices.json"
@@ -97,7 +92,6 @@ class OrderCreate(BaseModel):
                         raise ValueError(f"SELL price (${trigger_price}) cannot be lower than current price of {target_token} (${live_price:.4f}).")
             except json.JSONDecodeError:
                 pass
-        # ------------------------------------------------------
 
         try:
             response = requests.get(f"{PUBLIC_BASE}/markets/info", timeout=10)
@@ -176,13 +170,11 @@ def get_price(sell: str, buy: str):
         s = sell.upper()
         b = buy.upper()
         
-        # Handle external USD pairs directly
         if b in {"USD", "USDC"}:
             market = f"{s}-{b}"
         elif s in {"USD", "USDC"}:
             market = f"{b}-{s}"
         else:
-            # For native CC pairs
             if s == "CC":
                 market = f"{b}-CC"
             else:
