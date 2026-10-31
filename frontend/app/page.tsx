@@ -4,10 +4,15 @@ import { useState } from "react";
 import { OrderForm } from "@/components/orderForm";
 import { OrderTable } from "@/components/orderTable";
 import { MarketBar } from "@/components/marketBar"; 
-import { Wallet, Activity, Bell, Home as HomeIcon } from "lucide-react";
+import { Wallet, Activity, Bell, Home as HomeIcon, PlusCircle, List } from "lucide-react";
 
 export default function Home() {
   const [refreshTrigger, setRefreshTrigger] = useState(0);
+  const [activeTab, setActiveTab] = useState<"create" | "orders">("create");
+
+  const handleOrderCreated = () => {
+    setRefreshTrigger((p) => p + 1);
+  };
 
   return (
     <div className="min-h-screen flex flex-col">
@@ -41,35 +46,76 @@ export default function Home() {
         <Bell size={18} className="text-granite" />
       </div>
 
-      {/* MARKET BAR (BTC & CC PRICES) */}
-      <MarketBar />
+      {/* MARKET BAR (Sticky) */}
+      <div className="sticky top-[57px] md:top-[69px] z-40">
+        <MarketBar />
+      </div>
 
       {/* Main Content */}
-      <main className="flex-1 max-w-7xl w-full mx-auto p-4 md:p-8">
-        <div className="mb-6">
-          <h1 className="text-xl md:text-2xl font-medium text-snow mb-1">Trading Dashboard</h1>
-          <p className="text-granite text-sm">Manage your semi-automated strategies.</p>
+      <main className="flex-1 max-w-5xl w-full mx-auto p-4 md:p-8 pb-24 md:pb-8">
+        
+        {/* Header & Tabs */}
+        <div className="mb-6 flex flex-col md:flex-row md:items-end justify-between gap-4 mt-4">
+          <div>
+            <h1 className="text-xl md:text-2xl font-medium text-snow mb-1">Trading Dashboard</h1>
+            <p className="text-granite text-sm">Manage your semi-automated strategies.</p>
+          </div>
+
+          {/* Tab Switcher */}
+          <div className="flex bg-carbon p-1 rounded-lg border border-jet-black w-full md:w-auto">
+            <button
+              onClick={() => setActiveTab("create")}
+              className={`flex-1 md:flex-none flex items-center justify-center gap-2 px-6 py-2 text-sm font-medium rounded-md transition-all ${
+                activeTab === "create" ? "bg-jet-black text-emerald" : "text-granite hover:text-snow"
+              }`}
+            >
+              <PlusCircle size={16} />
+              Create Trade
+            </button>
+            <button
+              onClick={() => setActiveTab("orders")}
+              className={`flex-1 md:flex-none flex items-center justify-center gap-2 px-6 py-2 text-sm font-medium rounded-md transition-all ${
+                activeTab === "orders" ? "bg-jet-black text-emerald" : "text-granite hover:text-snow"
+              }`}
+            >
+              <List size={16} />
+              Active Orders
+            </button>
+          </div>
         </div>
 
-        <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
-          <div className="lg:col-span-4 order-2 lg:order-1">
-            <OrderForm onOrderCreated={() => setRefreshTrigger(p => p + 1)} />
-          </div>
-          <div className="lg:col-span-8 order-1 lg:order-2">
-            <OrderTable refreshTrigger={refreshTrigger} />
-          </div>
+        {/* Tab Content */}
+        <div className="w-full">
+          {activeTab === "create" && (
+            <div className="max-w-xl mx-auto w-full animate-in fade-in slide-in-from-bottom-2 duration-300">
+              <OrderForm onOrderCreated={handleOrderCreated} />
+            </div>
+          )}
+
+          {activeTab === "orders" && (
+            <div className="w-full animate-in fade-in slide-in-from-bottom-2 duration-300">
+              <OrderTable refreshTrigger={refreshTrigger} />
+            </div>
+          )}
         </div>
+
       </main>
 
       {/* MOBILE BOTTOM NAVBAR */}
-      <nav className="md:hidden fixed bottom-0 left-0 w-full bg-onyx border-t border-shadow-grey flex justify-around items-center py-3 z-50">
-        <div className="flex flex-col items-center text-emerald cursor-pointer">
-          <HomeIcon size={20} />
-          <span className="text-[10px] mt-1 font-medium">Home</span>
+      <nav className="md:hidden fixed bottom-0 left-0 w-full bg-onyx border-t border-shadow-grey flex justify-around items-center pt-2 pb-6 z-50">
+        <div 
+          onClick={() => setActiveTab("create")}
+          className={`flex flex-col items-center cursor-pointer transition-colors ${activeTab === "create" ? "text-emerald" : "text-granite"}`}
+        >
+          <PlusCircle size={20} />
+          <span className="text-[10px] mt-1 font-medium">Create</span>
         </div>
-        <div className="flex flex-col items-center text-granite hover:text-snow cursor-pointer transition-colors">
-          <Activity size={20} />
-          <span className="text-[10px] mt-1">Markets</span>
+        <div 
+          onClick={() => setActiveTab("orders")}
+          className={`flex flex-col items-center cursor-pointer transition-colors ${activeTab === "orders" ? "text-emerald" : "text-granite"}`}
+        >
+          <List size={20} />
+          <span className="text-[10px] mt-1 font-medium">Orders</span>
         </div>
         <div className="flex flex-col items-center text-granite hover:text-snow cursor-pointer transition-colors">
           <Wallet size={20} />

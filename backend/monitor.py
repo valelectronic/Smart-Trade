@@ -11,7 +11,8 @@ import websockets
 from dotenv import load_dotenv
 
 from cantex_api import connect_sdk, discover_market
-from database import get_all_orders, init_db
+# --- CHANGED: Points to new Postgres file ---
+from postgres_database import get_all_orders, init_db
 from helpers import (
     dec,
     get_cc_balance,
@@ -38,6 +39,7 @@ COOLDOWN_SECONDS = float(getattr(config, "COOLDOWN_SECONDS", 60))
 ORDER_REFRESH_SECONDS = 5
 INITIAL_RECONNECT_SECONDS = 2
 MAX_RECONNECT_SECONDS = 30
+PRINT_COOLDOWN_SECONDS = 5  # NEW: Only print to terminal every 5 seconds per market
 
 PRICES_FILE = ROOT / "prices.json"
 
@@ -55,7 +57,7 @@ def save_live_price(market, usd_price):
         with PRICES_FILE.open("w") as f:
             json.dump(prices, f)
             
-        # Broadcast to connected WebSocket clients
+        # Broadcast to connected WebSocket clients (INSTANT, NO COOLDOWN)
         asyncio.create_task(broadcast_price(market, float(usd_price)))
             
     except Exception as e:
@@ -173,6 +175,9 @@ async def run_monitor():
         active_signature = None
         market_channels = {}
         reconnect_delay = INITIAL_RECONNECT_SECONDS
+        
+        # NEW: Track when we last printed to prevent terminal spam
+        last_print_time = {}
 
         print("[SAFETY] Quote-only mode. No swap-submission method is called.")
 
@@ -271,21 +276,26 @@ async def run_monitor():
                                 log_event("WS_BAD_RATE", details=f"data={data}")
                                 continue
                             rate_source.update(rate_value)
-                            # Broadcast the rate to the UI (it's already USD)
+                            
+                            # Print rate every 5 seconds to prevent spam
+                            now = time.monotonic()
+                            if now - last_print_time.get(RATE_MARKET_SYMBOL, 0) >= PRINT_COOLDOWN_SECONDS:
+                                print(f"[RATE] {RATE_MARKET_SYMBOL} updated: {rate_value} USDC per CC")
+                                last_print_time[RATE_MARKET_SYMBOL] = now
+                                
+                            # Broadcast instantly to UI
                             asyncio.create_task(broadcast_price(RATE_MARKET_SYMBOL, float(rate_value)))
                             continue
 
                         if channel == btc_channel:
                             btc_value = ticker_price_from_message(message)
                             if btc_value is not None:
-                                # External stream is already USD
                                 asyncio.create_task(broadcast_price(BTC_MARKET_SYMBOL, float(btc_value)))
                             continue
 
                         if channel == eth_channel:
                             eth_value = ticker_price_from_message(message)
                             if eth_value is not None:
-                                # External stream is already USD
                                 asyncio.create_task(broadcast_price(ETH_MARKET_SYMBOL, float(eth_value)))
                             continue
 
@@ -308,8 +318,15 @@ async def run_monitor():
                             log_event("USD_PRICE_UNAVAILABLE", market=market_symbol, price=price, cc_usd_rate=cc_usd_rate)
                             continue
 
+                        # 1. Save & Broadcast INSTANTLY (No Cooldown)
                         save_live_price(market_symbol, usd_price)
-                        print(f"[{stamp}] {market_symbol}: ticker={price}; USD-equivalent={usd_price}")
+                        
+                        # 2. Print to terminal every 5 seconds (Spam Control)
+                        now = time.monotonic()
+                        if now - last_print_time.get(market_symbol, 0) >= PRINT_COOLDOWN_SECONDS:
+                            print(f"[{stamp}] {market_symbol}: ticker={price}; USD-equivalent={usd_price}")
+                            last_print_time[market_symbol] = now
+
                         log_event("PRICE", market=market_symbol, price=price, usd_price=usd_price, cc_usd_rate=cc_usd_rate)
 
                         for order in active_orders:

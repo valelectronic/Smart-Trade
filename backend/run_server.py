@@ -6,7 +6,8 @@ import os
 import uvicorn
 
 from api import app
-from database import init_db
+# --- CHANGED: Points to new Postgres file ---
+from postgres_database import init_db
 from monitor import run_monitor
 
 

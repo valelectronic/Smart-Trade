@@ -1,7 +1,8 @@
 """FastAPI endpoints for managing Cantex monitoring orders."""
 
 import requests
-import sqlite3
+import psycopg2
+import psycopg2.errors
 import uuid
 import json
 import asyncio
@@ -17,7 +18,8 @@ from pydantic import BaseModel, ConfigDict, Field
 from cantex_api import connect_sdk
 from helpers import get_token_balance
 
-from database import add_order, delete_order, get_all_orders, init_db
+# --- CHANGED: Points to new Postgres file ---
+from postgres_database import add_order, delete_order, get_all_orders, init_db
 from config import PUBLIC_BASE
 
 
@@ -41,7 +43,7 @@ app.add_middleware(
         "http://127.0.0.1:3000",
         "https://frontend-hazel-iota-70.vercel.app",
     ],
-    allow_credentials=False,
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -188,10 +190,20 @@ def get_price(sell: str, buy: str):
         with prices_file.open("r") as f:
             prices = json.load(f)
             
-        if market not in prices:
-            return {"error": f"No live price for {market} yet", "price": "0"}
+        if market in prices:
+            return {"market": market, "price": prices[market]}
+        
+        if s != "CC" and b == "CC":
+            reversed_market = f"CC-{s}"
+            if reversed_market in prices:
+                return {"market": reversed_market, "price": prices[reversed_market]}
+                
+        if b in {"USD", "USDC"}:
+            reversed_market = f"{b}-{s}"
+            if reversed_market in prices:
+                return {"market": reversed_market, "price": prices[reversed_market]}
             
-        return {"market": market, "price": prices[market]}
+        return {"error": f"No live price for {market} yet", "price": "0"}
     except Exception as e:
         return {"error": str(e), "price": "0"}
 
@@ -209,13 +221,15 @@ async def get_balances():
         client = await connect_sdk()
         account = await client.get_account_info()
         
-        tokens = ["CC", "NEOPRIME", "USDCX", "USDXLR", "USX", "USTY", "tf-usdt"]
         balances = {}
         
-        for t in tokens:
-            bal = get_token_balance(account, t)
-            if bal is not None:
-                balances[t] = str(bal)
+        for item in getattr(account, "tokens", []) or []:
+            symbol = getattr(item, "instrument_symbol", None)
+            unlocked = getattr(item, "unlocked_amount", None)
+            
+            if symbol and unlocked is not None:
+                bal = Decimal(str(unlocked))
+                balances[symbol.upper()] = str(bal)
                 
         close = getattr(client, "close", None)
         if close:
@@ -226,7 +240,6 @@ async def get_balances():
         return balances
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to fetch balances: {str(e)}")
-
 
 @app.get("/api/orders")
 def list_orders():
@@ -245,12 +258,13 @@ def create_order(order: OrderCreate):
 
     try:
         return add_order(record)
-    except sqlite3.IntegrityError as exc:
+    # --- CHANGED: Catch Postgres UniqueViolation ---
+    except psycopg2.errors.UniqueViolation as exc:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail=f"An order with id {record['id']!r} already exists.",
         ) from exc
-    except (sqlite3.Error, ValueError) as exc:
+    except (psycopg2.Error, ValueError) as exc:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=str(exc),
@@ -318,7 +332,8 @@ def get_history(sell: str, buy: str):
 def remove_order(order_id: str):
     try:
         deleted = delete_order(order_id)
-    except sqlite3.Error as exc:
+    # --- CHANGED: Catch Postgres Error ---
+    except psycopg2.Error as exc:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Could not delete the order.",

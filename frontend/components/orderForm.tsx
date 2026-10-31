@@ -26,17 +26,31 @@ export function OrderForm({ onOrderCreated }: { onOrderCreated: () => void }) {
   const [amount, setAmount] = useState("");
   const [errorMsg, setErrorMsg] = useState("");
 
-  // Fetch tokens and balances
+  // Fetch tokens and balances, then merge them
   useEffect(() => {
     Promise.all([getMarkets(), getBalances()]).then(([marketData, balanceData]) => {
       const uniqueTokens = new Set<string>();
+      
+      // 1. Add all tokens from the market data (FORCE UPPERCASE)
       marketData.forEach(m => {
-        uniqueTokens.add(m.base);
-        uniqueTokens.add(m.quote);
+        uniqueTokens.add(m.base.toUpperCase());
+        uniqueTokens.add(m.quote.toUpperCase());
       });
+
+      // 2. Add all tokens from the user's balances (FORCE UPPERCASE)
+      const upperBalances: Record<string, string> = {};
+      Object.keys(balanceData).forEach(token => {
+        const upperToken = token.toUpperCase();
+        uniqueTokens.add(upperToken);
+        upperBalances[upperToken] = balanceData[token];
+      });
+
+      // Add CC as a fallback just in case
+      uniqueTokens.add("CC");
+
       const tokens = Array.from(uniqueTokens).sort();
       setAvailableTokens(tokens);
-      setBalances(balanceData);
+      setBalances(upperBalances);
       
       if (tokens.length > 0) {
         setSellToken(tokens[0]);
@@ -84,7 +98,6 @@ export function OrderForm({ onOrderCreated }: { onOrderCreated: () => void }) {
       return;
     }
 
-    // 1. Check balance
     const currentBalance = parseFloat(balances[sellToken] || "0");
     const requestedAmount = parseFloat(amount);
 
@@ -93,22 +106,18 @@ export function OrderForm({ onOrderCreated }: { onOrderCreated: () => void }) {
       return;
     }
 
-    // 2. Check minimum CC size (exactly 100 CC)
     if (sellToken === "CC" && requestedAmount < 100) {
       setErrorMsg("Minimum trade size is 100 CC.");
       return;
     }
 
     const priceInput = parseFloat(triggerPrice);
-    
-    // If selling a token for CC, the value must be at least 100 CC (~$10)
     const tradeValueUsd = sellToken === "CC" ? requestedAmount : requestedAmount * priceInput;
     if (tradeValueUsd < 10) {
       setErrorMsg("Trade size too small. Minimum is ~100 CC equivalent.");
       return;
     }
 
-    // 3. Fetch the FRESHEST price of the target token before submitting
     const targetToken = action === "SELL" ? buyToken : sellToken;
     let freshPrice = livePrice;
     
@@ -116,20 +125,19 @@ export function OrderForm({ onOrderCreated }: { onOrderCreated: () => void }) {
       const priceData = await getLivePrice(targetToken, "CC");
       if (priceData.price && priceData.price !== "0") {
         freshPrice = parseFloat(priceData.price);
-        setLivePrice(freshPrice); // Update the UI
+        setLivePrice(freshPrice);
       }
     } catch (err) {
       console.error("Could not fetch fresh price before submit");
     }
 
-    // 4. Price Validation using the FRESHEST token price
     if (freshPrice > 0) {
       if (action === "SELL" && priceInput < freshPrice) {
-        setErrorMsg(`For SELL RISE, target must be ABOVE the price of ${targetToken} ($${freshPrice.toFixed(4)}).`);
+        setErrorMsg(`For SELL RISE, target must be ABOVE the price of ${targetToken} ($${freshPrice.toFixed(5)}).`);
         return;
       }
       if (action === "BUY" && priceInput > freshPrice) {
-        setErrorMsg(`For BUY DIP, target must be BELOW the price of ${targetToken} ($${freshPrice.toFixed(4)}).`);
+        setErrorMsg(`For BUY DIP, target must be BELOW the price of ${targetToken} ($${freshPrice.toFixed(5)}).`);
         return;
       }
     }
@@ -153,8 +161,12 @@ export function OrderForm({ onOrderCreated }: { onOrderCreated: () => void }) {
       setErrorMsg("");
       onOrderCreated();
       
-      // Refresh balances
-      getBalances().then(setBalances);
+      // Refresh balances and force UPPERCASE
+      getBalances().then(data => {
+        const upper: Record<string,string> = {};
+        Object.keys(data).forEach(k => upper[k.toUpperCase()] = data[k]);
+        setBalances(upper);
+      });
     } catch (error: any) {
       toast.error(error.message || "Failed to create order");
     } finally {
@@ -259,7 +271,7 @@ export function OrderForm({ onOrderCreated }: { onOrderCreated: () => void }) {
           <div>
             <Label>Trigger Price (USD)</Label>
             <input 
-              type="number" step="any" required placeholder={livePrice > 0 ? `~${livePrice.toFixed(4)}` : "0.00"}
+              type="number" step="any" required placeholder={livePrice > 0 ? `~${livePrice.toFixed(5)}` : "0.00"}
               className="w-full bg-carbon border border-jet-black rounded-lg p-3 text-snow font-mono text-sm focus:ring-1 focus:ring-emerald outline-none"
               value={triggerPrice} onChange={(e) => setTriggerPrice(e.target.value)}
             />

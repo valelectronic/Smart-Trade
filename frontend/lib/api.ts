@@ -1,6 +1,6 @@
 import { Order, MarketData } from "@/types";
 
-const API_URL = "https://smart-trade-production-44e4.up.railway.app/api";
+const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://127.0.0.1:8000/api";
 
 export async function getOrders(): Promise<Order[]> {
   const res = await fetch(`${API_URL}/orders`, { cache: "no-store" });

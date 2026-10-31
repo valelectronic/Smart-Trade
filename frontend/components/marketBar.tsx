@@ -9,9 +9,8 @@ export function MarketBar() {
 
   useEffect(() => {
     // Determine the API and WebSocket URLs dynamically
-    const apiUrl = "https://smart-trade-production-44e4.up.railway.app/api";
-const wsUrl = "wss://smart-trade-production-44e4.up.railway.app";
-
+   const apiUrl = process.env.NEXT_PUBLIC_API_URL || "http://127.0.0.1:8000/api";
+const wsUrl = apiUrl.replace("https://", "wss://").replace("http://", "ws://").replace("/api", "");
     // Polling fallback (ensures prices always update)
     const fetchPrices = async () => {
       try {
