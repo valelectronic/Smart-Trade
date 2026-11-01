@@ -1,6 +1,7 @@
+
 "use client";
 
-import { useState } from "react";
+import { useState, useEffect } from "react"; // <-- Added useEffect
 import { OrderForm } from "@/components/orderForm";
 import { OrderTable } from "@/components/orderTable";
 import { MarketBar } from "@/components/marketBar"; 
@@ -8,14 +9,25 @@ import { Wallet, Activity, Bell, Home as HomeIcon, PlusCircle, List } from "luci
 
 export default function Home() {
   const [refreshTrigger, setRefreshTrigger] = useState(0);
-  const [activeTab, setActiveTab] = useState<"create" | "orders">("create");
+  
+  const [activeTab, setActiveTab] = useState<"create" | "orders">(() => {
+    if (typeof window !== "undefined") {
+      const saved = localStorage.getItem("cantex_activeTab");
+      if (saved === "create" || saved === "orders") return saved;
+    }
+    return "create";
+  });
+
+  useEffect(() => {
+    localStorage.setItem("cantex_activeTab", activeTab);
+  }, [activeTab]);
 
   const handleOrderCreated = () => {
     setRefreshTrigger((p) => p + 1);
   };
 
   return (
-    <div className="min-h-screen flex flex-col">
+    <div className="min-h-screen flex flex-col w-full">
       
       {/* DESKTOP TOP NAVBAR */}
       <nav className="hidden md:flex border-b border-shadow-grey bg-onyx px-6 py-4 items-center justify-between sticky top-0 z-50">
@@ -47,12 +59,12 @@ export default function Home() {
       </div>
 
       {/* MARKET BAR (Sticky) */}
-      <div className="sticky top-[57px] md:top-[69px] z-40">
-        <MarketBar />
-      </div>
+      <div className="sticky top-[57px] md:top-[69px] z-40 w-full overflow-hidden">
+  <MarketBar />
+</div>
 
       {/* Main Content */}
-      <main className="flex-1 max-w-5xl w-full mx-auto p-4 md:p-8 pb-24 md:pb-8">
+      <main className="flex-1 max-w-5xl w-full mx-auto p-4 md:p-8 pb-24 md:pb-8 overflow-x-hidden">
         
         {/* Header & Tabs */}
         <div className="mb-6 flex flex-col md:flex-row md:items-end justify-between gap-4 mt-4">

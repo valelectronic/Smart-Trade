@@ -22,13 +22,11 @@ export function PriceTicker({
   useEffect(() => {
     if (!sellToken || !buyToken || sellToken === buyToken) return;
 
-    // 1. Reset state
     setPrice(null);
     setPrevPrice(null);
     setHistory([]);
     setStatus("loading");
 
-    // 2. THE FIX: ALWAYS monitor the token you are BUYING (You Receive).
     const targetToken = buyToken.toUpperCase(); 
     
     if (targetToken === "CC") {
@@ -39,7 +37,6 @@ export function PriceTicker({
     const apiUrl = process.env.NEXT_PUBLIC_API_URL || "http://127.0.0.1:8000/api";
     const wsUrl = apiUrl.replace("https://", "wss://").replace("http://", "ws://").replace("/api", "");
 
-    // 3. Try both directions to be safe (e.g., CETH-CC or CC-CETH)
     const market1 = `${targetToken}-CC`;
     const market2 = `CC-${targetToken}`;
 
@@ -78,7 +75,6 @@ export function PriceTicker({
     ws.onmessage = (event) => {
       try {
         const data = JSON.parse(event.data);
-        // Check if the WebSocket message matches either market format
         if (data.market === market1 || data.market === market2) {
           const newPrice = parseFloat(data.price);
           setPrice((currentPrice) => {
@@ -107,12 +103,13 @@ export function PriceTicker({
   const isUp = prevPrice !== null && price !== null && price > prevPrice;
   const isDown = prevPrice !== null && price !== null && price < prevPrice;
   
-  // Display the token we are monitoring (the BUY token)
   const displayToken = buyToken.toUpperCase();
 
   return (
     <Card className="bg-carbon border-jet-black mb-4 p-0 overflow-hidden flex flex-col">
-      <div className="p-4 flex items-center justify-between border-b border-jet-black/50 gap-2">
+      
+      {/* --- CHANGED TOP SECTION --- */}
+      <div className="p-4 flex flex-col sm:flex-row sm:items-center justify-between border-b border-jet-black/50 gap-3 sm:gap-2">
         
         <div className="flex items-center gap-3 min-w-0">
           <div className="p-2 bg-jet-black rounded-lg shrink-0">
@@ -126,7 +123,7 @@ export function PriceTicker({
           </div>
         </div>
 
-        <div className="flex items-center gap-2 shrink-0">
+        <div className="flex items-center gap-2 shrink-0 sm:justify-end">
           {status === "loading" && (
             <span className="text-sm text-granite animate-pulse">Fetching...</span>
           )}
@@ -135,15 +132,16 @@ export function PriceTicker({
           )}
           {status === "ready" && (
             <>
-              <span className={`text-xl md:text-2xl font-mono font-bold transition-colors duration-300 ${isUp ? 'text-emerald' : isDown ? 'text-red-400' : 'text-snow'}`}>
+              <span className={`text-2xl md:text-3xl font-mono font-bold break-all transition-colors duration-300 ${isUp ? 'text-emerald' : isDown ? 'text-red-400' : 'text-snow'}`}>
                 ${price ? price.toFixed(5) : "0.00000"}
               </span>
-              {isUp && <TrendingUp size={20} className="text-emerald" />}
-              {isDown && <TrendingDown size={20} className="text-red-400" />}
+              {isUp && <TrendingUp size={20} className="text-emerald shrink-0" />}
+              {isDown && <TrendingDown size={20} className="text-red-400 shrink-0" />}
             </>
           )}
         </div>
       </div>
+      {/* --- END OF CHANGED SECTION --- */}
       
       <div className="h-24 w-full bg-onyx-dark/30">
         <ResponsiveContainer width="100%" height="100%">

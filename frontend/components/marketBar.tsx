@@ -45,7 +45,7 @@ const wsUrl = apiUrl.replace("https://", "wss://").replace("http://", "ws://").r
   }, []);
 
   return (
-    <div className="flex items-center gap-6 bg-onyx border-b border-shadow-grey px-4 md:px-8 py-2 text-sm font-mono overflow-x-auto whitespace-nowrap">
+    <div className="flex items-center gap-6 bg-onyx border-b border-shadow-grey px-4 md:px-8 py-2 text-sm font-mono overflow-x-auto whitespace-nowrap no-scrollbar">
       <div className="flex items-center gap-2">
         <Bitcoin size={16} className="text-amber-500" />
         <span className="text-granite">BTC/USD</span>

@@ -19,12 +19,41 @@ export function OrderForm({ onOrderCreated }: { onOrderCreated: () => void }) {
   const sellRef = useRef<HTMLDivElement>(null);
   const buyRef = useRef<HTMLDivElement>(null);
 
-  const [sellToken, setSellToken] = useState<string>("");
-  const [buyToken, setBuyToken] = useState<string>("");
-  const [action, setAction] = useState<"BUY" | "SELL">("SELL");
+  // --- CHANGED: Initialize from localStorage if available ---
+  const [sellToken, setSellToken] = useState<string>(() => {
+    if (typeof window !== "undefined") return localStorage.getItem("cantex_sellToken") || "";
+    return "";
+  });
+  
+  const [buyToken, setBuyToken] = useState<string>(() => {
+    if (typeof window !== "undefined") return localStorage.getItem("cantex_buyToken") || "";
+    return "";
+  });
+  
+  const [action, setAction] = useState<"BUY" | "SELL">(() => {
+    if (typeof window !== "undefined") {
+      const saved = localStorage.getItem("cantex_action");
+      if (saved === "BUY" || saved === "SELL") return saved;
+    }
+    return "SELL";
+  });
+
   const [triggerPrice, setTriggerPrice] = useState("");
   const [amount, setAmount] = useState("");
   const [errorMsg, setErrorMsg] = useState("");
+
+  // --- CHANGED: Save preferences to localStorage whenever they change ---
+  useEffect(() => {
+    if (sellToken) localStorage.setItem("cantex_sellToken", sellToken);
+  }, [sellToken]);
+
+  useEffect(() => {
+    if (buyToken) localStorage.setItem("cantex_buyToken", buyToken);
+  }, [buyToken]);
+
+  useEffect(() => {
+    localStorage.setItem("cantex_action", action);
+  }, [action]);
 
   // Fetch tokens and balances, then merge them
   useEffect(() => {
@@ -52,19 +81,21 @@ export function OrderForm({ onOrderCreated }: { onOrderCreated: () => void }) {
       setAvailableTokens(tokens);
       setBalances(upperBalances);
       
+      // --- CHANGED: Only set defaults if we don't already have saved tokens ---
       if (tokens.length > 0) {
-        setSellToken(tokens[0]);
-        setBuyToken(tokens[1] || tokens[0]);
+        if (!sellToken) setSellToken(tokens[0]);
+        if (!buyToken) setBuyToken(tokens[1] || tokens[0]);
       }
     }).catch(() => toast.error("Could not load market data."));
-  }, []);
+  }, []); // Intentionally empty dependency array so it runs once
 
   // Fetch live price of the target token when tokens or action change
   useEffect(() => {
     if (sellToken && buyToken && sellToken !== buyToken) {
-      const targetToken = action === "SELL" ? buyToken : sellToken;
-      
-      getLivePrice(targetToken, "CC").then(data => {
+      // ALWAYS monitor the token we are trying to BUY
+      const targetToken = buyToken; 
+
+      getLivePrice(targetToken, "USDC").then(data => {
         if (data.price && data.price !== "0") {
           setLivePrice(parseFloat(data.price));
         } else {
@@ -118,11 +149,12 @@ export function OrderForm({ onOrderCreated }: { onOrderCreated: () => void }) {
       return;
     }
 
-    const targetToken = action === "SELL" ? buyToken : sellToken;
+    // ALWAYS validate against the token we are trying to BUY
+    const targetToken = buyToken; 
     let freshPrice = livePrice;
-    
+
     try {
-      const priceData = await getLivePrice(targetToken, "CC");
+      const priceData = await getLivePrice(targetToken, "USDC");
       if (priceData.price && priceData.price !== "0") {
         freshPrice = parseFloat(priceData.price);
         setLivePrice(freshPrice);
@@ -156,9 +188,21 @@ export function OrderForm({ onOrderCreated }: { onOrderCreated: () => void }) {
       });
       
       toast.success("Order saved successfully!");
+      
+      // --- CHANGED: Clear form and localStorage on success ---
       setTriggerPrice("");
       setAmount("");
       setErrorMsg("");
+      
+      localStorage.removeItem("cantex_sellToken");
+      localStorage.removeItem("cantex_buyToken");
+      localStorage.removeItem("cantex_action");
+
+      // Reset tokens to force a refresh of the dropdowns
+      setSellToken("");
+      setBuyToken("");
+      setAction("SELL");
+
       onOrderCreated();
       
       // Refresh balances and force UPPERCASE
