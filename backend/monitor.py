@@ -135,18 +135,15 @@ def usd_price_from_ticker(market_symbol, ticker_price, cc_usd_rate):
                 with PRICES_FILE.open("r") as f:
                     prices = json.load(f)
                 
-                # Try to get the rate from the file
                 rate_from_file = prices.get("CC-USDC")
                 if rate_from_file:
                     return price * dec(rate_from_file)
-                    
         except Exception as e:
             print(f"[PRICE FALLBACK ERROR] {e}")
             
         return None
         
     return None
-
 
 def ticker_price_from_message(message):
     data = message.get("data") or {}
@@ -295,6 +292,7 @@ async def run_monitor():
                                 log_event("WS_BAD_RATE", details=f"data={data}")
                                 continue
                             rate_source.update(rate_value)
+                            save_live_price(RATE_MARKET_SYMBOL, rate_value)
                             
                             # Print rate every 5 seconds to prevent spam
                             now = time.monotonic()
