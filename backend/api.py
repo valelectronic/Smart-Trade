@@ -257,7 +257,14 @@ def create_order(order: OrderCreate):
         ) from exc
 
     try:
-        return add_order(record)
+        result = add_order(record)
+        # Force the engine to refresh immediately
+        try:
+            from monitor import subscription_queue
+            subscription_queue.put_nowait("refresh")
+        except Exception:
+            pass
+        return result
     # --- CHANGED: Catch Postgres UniqueViolation ---
     except psycopg2.errors.UniqueViolation as exc:
         raise HTTPException(

@@ -206,8 +206,10 @@ async def run_monitor():
                 market_channels = await discover_order_channels(orders)
                 active_orders = [order for order in orders if order["market"] in market_channels]
                 for order in active_orders:
-                    armed.setdefault(order["id"], True)
-                    last_trigger.setdefault(order["id"], 0.0)
+                    if order["id"] not in armed:
+                        armed[order["id"]] = True
+                        # Start the cooldown timer from NOW, not 0.0
+                        last_trigger[order["id"]] = time.monotonic()
                 active_ids = {order["id"] for order in active_orders}
                 armed = {order_id: value for order_id, value in armed.items() if order_id in active_ids}
                 last_trigger = {order_id: value for order_id, value in last_trigger.items() if order_id in active_ids}
@@ -227,6 +229,10 @@ async def run_monitor():
                     while True:
                         try:
                             new_market = subscription_queue.get_nowait()
+                            if new_market == "refresh":
+                                # Force an immediate order refresh
+                                next_order_refresh = time.monotonic()
+                                continue
                             if new_market not in market_channels:
                                 try:
                                     _, channel = await asyncio.to_thread(discover_market, new_market)
@@ -250,8 +256,9 @@ async def run_monitor():
                                 market_channels = await discover_order_channels(latest_orders)
                                 active_orders = [order for order in latest_orders if order["market"] in market_channels]
                                 for order in active_orders:
-                                    armed.setdefault(order["id"], True)
-                                    last_trigger.setdefault(order["id"], 0.0)
+                                    if order["id"] not in armed:
+                                        armed[order["id"]] = True
+                                        last_trigger[order["id"]] = time.monotonic()
                                 active_ids = {order["id"] for order in active_orders}
                                 armed = {key: value for key, value in armed.items() if key in active_ids}
                                 last_trigger = {key: value for key, value in last_trigger.items() if key in active_ids}
