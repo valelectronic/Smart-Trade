@@ -118,6 +118,7 @@ export function OrderForm({ onOrderCreated }: { onOrderCreated: () => void }) {
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
+     if (isLoading) return;
     setErrorMsg("");
 
     if (sellToken === buyToken) {
@@ -264,10 +265,11 @@ export function OrderForm({ onOrderCreated }: { onOrderCreated: () => void }) {
           <TokenDropdown selected={sellToken} onSelect={setSellToken} isOpen={isSellOpen} setIsOpen={setIsSellOpen} refObj={sellRef} />
           
           {/* Live price of the token you are paying with */}
+                    {/* Live price of the token you are paying with */}
           {sellLivePrice > 0 && (
-            <div className="mt-1.5 text-[10px] text-granite font-mono flex items-center gap-1">
-              <span className="w-1 h-1 rounded-full bg-granite animate-pulse"></span>
-              Market Price: ${sellLivePrice.toFixed(5)}
+            <div className="mt-2 px-2 py-1 bg-carbon rounded-md text-[10px] text-granite font-mono flex items-center gap-1.5 w-fit">
+              <span className="w-1.5 h-1.5 rounded-full bg-granite animate-pulse"></span>
+              Market: ${sellLivePrice.toFixed(5)}
             </div>
           )}
         </div>
@@ -289,12 +291,12 @@ export function OrderForm({ onOrderCreated }: { onOrderCreated: () => void }) {
             <span className="text-xs text-granite">Bal: {balances[buyToken] ? parseFloat(balances[buyToken]).toFixed(4) : "0.00"}</span>
           </div>
           <TokenDropdown selected={buyToken} onSelect={setBuyToken} isOpen={isBuyOpen} setIsOpen={setIsBuyOpen} refObj={buyRef} />
-          
-          {/* Live price of the token you are trying to buy */}
+
+                    {/* Live price of the token you are trying to buy */}
           {livePrice > 0 && (
-            <div className="mt-1.5 text-[10px] text-emerald font-mono flex items-center gap-1">
-              <span className="w-1 h-1 rounded-full bg-emerald animate-pulse"></span>
-              Target Market Price: ${livePrice.toFixed(5)}
+            <div className="mt-2 px-2 py-1 bg-emerald/10 rounded-md text-xs text-emerald font-mono font-medium flex items-center gap-1.5 w-fit">
+              <span className="w-1.5 h-1.5 rounded-full bg-emerald animate-pulse"></span>
+              Target: ${livePrice.toFixed(5)}
             </div>
           )}
         </div>

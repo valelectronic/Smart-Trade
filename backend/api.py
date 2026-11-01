@@ -73,7 +73,7 @@ class OrderCreate(BaseModel):
 
         safe_direction = "BELOW" if self.action == "BUY" else "ABOVE"
 
-        target_token = buy_token if self.action == "BUY" else sell_token
+        target_token = buy_token
         target_market = f"{target_token}-CC"
         
         prices_file = Path(__file__).parent / "prices.json"
