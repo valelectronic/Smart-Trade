@@ -115,12 +115,12 @@ class OrderCreate(BaseModel):
         elif buy_token == "CC" and f"{sell_token}-CC" in valid_symbols:
             market = f"{sell_token}-CC"
         else:
-            if f"{sell_token}-CC" in valid_symbols:
-                market = f"{sell_token}-CC"
-                route_token = buy_token
-            elif f"{buy_token}-CC" in valid_symbols:
+            if f"{buy_token}-CC" in valid_symbols:
                 market = f"{buy_token}-CC"
                 route_token = sell_token
+            elif f"{sell_token}-CC" in valid_symbols:
+                market = f"{sell_token}-CC"
+                route_token = buy_token
             else:
                 raise ValueError(f"Could not find a valid route for {sell_token} to {buy_token} on Cantex.")
 
