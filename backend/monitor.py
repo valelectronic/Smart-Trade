@@ -120,12 +120,31 @@ def usd_price_from_ticker(market_symbol, ticker_price, cc_usd_rate):
     price = dec(ticker_price)
     if price is None or price <= 0:
         return None
+        
     if symbol.endswith("-USDCX") or symbol.endswith("-USDC"):
         return price
+        
     if symbol.endswith("-CC"):
-        if cc_usd_rate is None or cc_usd_rate <= 0:
-            return None
-        return price * cc_usd_rate
+        # 1. Try the live WebSocket rate first
+        if cc_usd_rate is not None and cc_usd_rate > 0:
+            return price * cc_usd_rate
+            
+        # 2. FALLBACK: If the live rate is missing, read the saved rate from prices.json
+        try:
+            if PRICES_FILE.exists():
+                with PRICES_FILE.open("r") as f:
+                    prices = json.load(f)
+                
+                # Try to get the rate from the file
+                rate_from_file = prices.get("CC-USDC")
+                if rate_from_file:
+                    return price * dec(rate_from_file)
+                    
+        except Exception as e:
+            print(f"[PRICE FALLBACK ERROR] {e}")
+            
+        return None
+        
     return None
 
 
