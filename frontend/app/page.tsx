@@ -1,7 +1,6 @@
-
 "use client";
 
-import { useState, useEffect } from "react"; // <-- Added useEffect
+import { useState, useEffect } from "react";
 import { OrderForm } from "@/components/orderForm";
 import { OrderTable } from "@/components/orderTable";
 import { MarketBar } from "@/components/marketBar"; 
@@ -9,18 +8,24 @@ import { Wallet, Activity, Bell, Home as HomeIcon, PlusCircle, List } from "luci
 
 export default function Home() {
   const [refreshTrigger, setRefreshTrigger] = useState(0);
-  
-  const [activeTab, setActiveTab] = useState<"create" | "orders">(() => {
-    if (typeof window !== "undefined") {
-      const saved = localStorage.getItem("cantex_activeTab");
-      if (saved === "create" || saved === "orders") return saved;
-    }
-    return "create";
-  });
+  const [activeTab, setActiveTab] = useState<"create" | "orders">("create");
+  const [isMounted, setIsMounted] = useState(false);
 
+  // Load saved tab safely after mounting
   useEffect(() => {
-    localStorage.setItem("cantex_activeTab", activeTab);
-  }, [activeTab]);
+    const saved = localStorage.getItem("cantex_activeTab");
+    if (saved === "create" || saved === "orders") {
+      setActiveTab(saved);
+    }
+    setIsMounted(true);
+  }, []);
+
+  // Save tab whenever it changes (but only after initial mount)
+  useEffect(() => {
+    if (isMounted) {
+      localStorage.setItem("cantex_activeTab", activeTab);
+    }
+  }, [activeTab, isMounted]);
 
   const handleOrderCreated = () => {
     setRefreshTrigger((p) => p + 1);
@@ -60,8 +65,8 @@ export default function Home() {
 
       {/* MARKET BAR (Sticky) */}
       <div className="sticky top-[57px] md:top-[69px] z-40 w-full overflow-hidden">
-  <MarketBar />
-</div>
+        <MarketBar />
+      </div>
 
       {/* Main Content */}
       <main className="flex-1 max-w-5xl w-full mx-auto p-4 md:p-8 pb-24 md:pb-8 overflow-x-hidden">

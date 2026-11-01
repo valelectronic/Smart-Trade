@@ -12,61 +12,61 @@ export function OrderForm({ onOrderCreated }: { onOrderCreated: () => void }) {
   const [isLoading, setIsLoading] = useState(false);
   const [availableTokens, setAvailableTokens] = useState<string[]>([]);
   const [balances, setBalances] = useState<Record<string, string>>({});
-  const [livePrice, setLivePrice] = useState<number>(0);
+  
+  // Prices
+  const [livePrice, setLivePrice] = useState<number>(0);      // Price of BUY token
+  const [sellLivePrice, setSellLivePrice] = useState<number>(0); // Price of SELL token
   
   const [isSellOpen, setIsSellOpen] = useState(false);
   const [isBuyOpen, setIsBuyOpen] = useState(false);
   const sellRef = useRef<HTMLDivElement>(null);
   const buyRef = useRef<HTMLDivElement>(null);
 
-  // --- CHANGED: Initialize from localStorage if available ---
-  const [sellToken, setSellToken] = useState<string>(() => {
-    if (typeof window !== "undefined") return localStorage.getItem("cantex_sellToken") || "";
-    return "";
-  });
-  
-  const [buyToken, setBuyToken] = useState<string>(() => {
-    if (typeof window !== "undefined") return localStorage.getItem("cantex_buyToken") || "";
-    return "";
-  });
-  
-  const [action, setAction] = useState<"BUY" | "SELL">(() => {
-    if (typeof window !== "undefined") {
-      const saved = localStorage.getItem("cantex_action");
-      if (saved === "BUY" || saved === "SELL") return saved;
-    }
-    return "SELL";
-  });
-
+  // State declarations (start empty to prevent hydration mismatch)
+  const [sellToken, setSellToken] = useState<string>("");
+  const [buyToken, setBuyToken] = useState<string>("");
+  const [action, setAction] = useState<"BUY" | "SELL">("SELL");
   const [triggerPrice, setTriggerPrice] = useState("");
   const [amount, setAmount] = useState("");
   const [errorMsg, setErrorMsg] = useState("");
+  const [isMounted, setIsMounted] = useState(false);
 
-  // --- CHANGED: Save preferences to localStorage whenever they change ---
+  // Load from localStorage safely on mount
   useEffect(() => {
-    if (sellToken) localStorage.setItem("cantex_sellToken", sellToken);
-  }, [sellToken]);
+    const savedSell = localStorage.getItem("cantex_sellToken");
+    const savedBuy = localStorage.getItem("cantex_buyToken");
+    const savedAction = localStorage.getItem("cantex_action");
+
+    if (savedSell) setSellToken(savedSell);
+    if (savedBuy) setBuyToken(savedBuy);
+    if (savedAction === "BUY" || savedAction === "SELL") setAction(savedAction);
+
+    setIsMounted(true);
+  }, []);
+
+  // Save to localStorage only after mount
+  useEffect(() => {
+    if (isMounted && sellToken) localStorage.setItem("cantex_sellToken", sellToken);
+  }, [sellToken, isMounted]);
 
   useEffect(() => {
-    if (buyToken) localStorage.setItem("cantex_buyToken", buyToken);
-  }, [buyToken]);
+    if (isMounted && buyToken) localStorage.setItem("cantex_buyToken", buyToken);
+  }, [buyToken, isMounted]);
 
   useEffect(() => {
-    localStorage.setItem("cantex_action", action);
-  }, [action]);
+    if (isMounted) localStorage.setItem("cantex_action", action);
+  }, [action, isMounted]);
 
-  // Fetch tokens and balances, then merge them
+  // Fetch tokens and balances
   useEffect(() => {
     Promise.all([getMarkets(), getBalances()]).then(([marketData, balanceData]) => {
       const uniqueTokens = new Set<string>();
       
-      // 1. Add all tokens from the market data (FORCE UPPERCASE)
       marketData.forEach(m => {
         uniqueTokens.add(m.base.toUpperCase());
         uniqueTokens.add(m.quote.toUpperCase());
       });
 
-      // 2. Add all tokens from the user's balances (FORCE UPPERCASE)
       const upperBalances: Record<string, string> = {};
       Object.keys(balanceData).forEach(token => {
         const upperToken = token.toUpperCase();
@@ -74,36 +74,32 @@ export function OrderForm({ onOrderCreated }: { onOrderCreated: () => void }) {
         upperBalances[upperToken] = balanceData[token];
       });
 
-      // Add CC as a fallback just in case
       uniqueTokens.add("CC");
 
       const tokens = Array.from(uniqueTokens).sort();
       setAvailableTokens(tokens);
       setBalances(upperBalances);
       
-      // --- CHANGED: Only set defaults if we don't already have saved tokens ---
-      if (tokens.length > 0) {
-        if (!sellToken) setSellToken(tokens[0]);
-        if (!buyToken) setBuyToken(tokens[1] || tokens[0]);
-      }
+      // Only set defaults if we don't have saved tokens
+      setSellToken(prev => prev || tokens[0]);
+      setBuyToken(prev => prev || tokens[1] || tokens[0]);
     }).catch(() => toast.error("Could not load market data."));
-  }, []); // Intentionally empty dependency array so it runs once
+  }, []);
 
-  // Fetch live price of the target token when tokens or action change
+  // Fetch live prices for BOTH tokens
   useEffect(() => {
     if (sellToken && buyToken && sellToken !== buyToken) {
-      // ALWAYS monitor the token we are trying to BUY
-      const targetToken = buyToken; 
-
-      getLivePrice(targetToken, "USDC").then(data => {
-        if (data.price && data.price !== "0") {
-          setLivePrice(parseFloat(data.price));
-        } else {
-          setLivePrice(0);
-        }
+      // 1. Fetch price of the BUY token (what we are monitoring)
+      getLivePrice(buyToken, "USDC").then(data => {
+        setLivePrice(data.price && data.price !== "0" ? parseFloat(data.price) : 0);
       }).catch(() => setLivePrice(0));
+
+      // 2. Fetch price of the SELL token (what we are paying)
+      getLivePrice(sellToken, "USDC").then(data => {
+        setSellLivePrice(data.price && data.price !== "0" ? parseFloat(data.price) : 0);
+      }).catch(() => setSellLivePrice(0));
     }
-  }, [sellToken, buyToken, action]);
+  }, [sellToken, buyToken]);
 
   useEffect(() => {
     function handleClickOutside(event: MouseEvent) {
@@ -149,7 +145,6 @@ export function OrderForm({ onOrderCreated }: { onOrderCreated: () => void }) {
       return;
     }
 
-    // ALWAYS validate against the token we are trying to BUY
     const targetToken = buyToken; 
     let freshPrice = livePrice;
 
@@ -189,7 +184,6 @@ export function OrderForm({ onOrderCreated }: { onOrderCreated: () => void }) {
       
       toast.success("Order saved successfully!");
       
-      // --- CHANGED: Clear form and localStorage on success ---
       setTriggerPrice("");
       setAmount("");
       setErrorMsg("");
@@ -198,14 +192,12 @@ export function OrderForm({ onOrderCreated }: { onOrderCreated: () => void }) {
       localStorage.removeItem("cantex_buyToken");
       localStorage.removeItem("cantex_action");
 
-      // Reset tokens to force a refresh of the dropdowns
       setSellToken("");
       setBuyToken("");
       setAction("SELL");
 
       onOrderCreated();
       
-      // Refresh balances and force UPPERCASE
       getBalances().then(data => {
         const upper: Record<string,string> = {};
         Object.keys(data).forEach(k => upper[k.toUpperCase()] = data[k]);
@@ -270,6 +262,14 @@ export function OrderForm({ onOrderCreated }: { onOrderCreated: () => void }) {
             <span className="text-xs text-granite">Bal: {balances[sellToken] ? parseFloat(balances[sellToken]).toFixed(4) : "0.00"}</span>
           </div>
           <TokenDropdown selected={sellToken} onSelect={setSellToken} isOpen={isSellOpen} setIsOpen={setIsSellOpen} refObj={sellRef} />
+          
+          {/* Live price of the token you are paying with */}
+          {sellLivePrice > 0 && (
+            <div className="mt-1.5 text-[10px] text-granite font-mono flex items-center gap-1">
+              <span className="w-1 h-1 rounded-full bg-granite animate-pulse"></span>
+              Market Price: ${sellLivePrice.toFixed(5)}
+            </div>
+          )}
         </div>
 
         <div className="flex justify-center -my-2 relative z-20">
@@ -289,6 +289,14 @@ export function OrderForm({ onOrderCreated }: { onOrderCreated: () => void }) {
             <span className="text-xs text-granite">Bal: {balances[buyToken] ? parseFloat(balances[buyToken]).toFixed(4) : "0.00"}</span>
           </div>
           <TokenDropdown selected={buyToken} onSelect={setBuyToken} isOpen={isBuyOpen} setIsOpen={setIsBuyOpen} refObj={buyRef} />
+          
+          {/* Live price of the token you are trying to buy */}
+          {livePrice > 0 && (
+            <div className="mt-1.5 text-[10px] text-emerald font-mono flex items-center gap-1">
+              <span className="w-1 h-1 rounded-full bg-emerald animate-pulse"></span>
+              Target Market Price: ${livePrice.toFixed(5)}
+            </div>
+          )}
         </div>
 
         <div className="pt-2">
