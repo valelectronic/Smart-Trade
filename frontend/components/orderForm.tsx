@@ -139,13 +139,14 @@ export function OrderForm({ onOrderCreated }: { onOrderCreated: () => void }) {
       return;
     }
 
-    const priceInput = parseFloat(triggerPrice);
-    const tradeValueUsd = sellToken === "CC" ? requestedAmount : requestedAmount * priceInput;
-    if (tradeValueUsd < 10) {
-      setErrorMsg("Trade size too small. Minimum is ~100 CC equivalent.");
+           const priceInput = parseFloat(triggerPrice);
+    
+    // Cantex requires a minimum of 100 CC for CC trades.
+    // For other tokens, the backend/SDK will enforce the pool minimum.
+    if (sellToken === "CC" && requestedAmount < 100) {
+      setErrorMsg("Minimum trade size is 100 CC.");
       return;
     }
-
     const targetToken = buyToken; 
     let freshPrice = livePrice;
 
