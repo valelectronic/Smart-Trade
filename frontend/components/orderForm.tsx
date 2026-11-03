@@ -147,14 +147,18 @@ export function OrderForm({ onOrderCreated }: { onOrderCreated: () => void }) {
       setErrorMsg("Minimum trade size is 100 CC.");
       return;
     }
-    const targetToken = buyToken; 
-    let freshPrice = livePrice;
+
+
+        // Determine which token we are monitoring for the trigger
+    const monitorToken = action === "BUY" ? buyToken : sellToken;
+    let freshPrice = action === "BUY" ? livePrice : sellLivePrice;
 
     try {
-      const priceData = await getLivePrice(targetToken, "USDC");
+      const priceData = await getLivePrice(monitorToken, "USDC");
       if (priceData.price && priceData.price !== "0") {
         freshPrice = parseFloat(priceData.price);
-        setLivePrice(freshPrice);
+        if (action === "BUY") setLivePrice(freshPrice);
+        else setSellLivePrice(freshPrice);
       }
     } catch (err) {
       console.error("Could not fetch fresh price before submit");
@@ -162,11 +166,11 @@ export function OrderForm({ onOrderCreated }: { onOrderCreated: () => void }) {
 
     if (freshPrice > 0) {
       if (action === "SELL" && priceInput < freshPrice) {
-        setErrorMsg(`For SELL RISE, target must be ABOVE the price of ${targetToken} ($${freshPrice.toFixed(5)}).`);
+        setErrorMsg(`For SELL RISE, target must be ABOVE the price of ${monitorToken} ($${freshPrice.toFixed(5)}).`);
         return;
       }
       if (action === "BUY" && priceInput > freshPrice) {
-        setErrorMsg(`For BUY DIP, target must be BELOW the price of ${targetToken} ($${freshPrice.toFixed(5)}).`);
+        setErrorMsg(`For BUY DIP, target must be BELOW the price of ${monitorToken} ($${freshPrice.toFixed(5)}).`);
         return;
       }
     }
@@ -265,14 +269,13 @@ export function OrderForm({ onOrderCreated }: { onOrderCreated: () => void }) {
           </div>
           <TokenDropdown selected={sellToken} onSelect={setSellToken} isOpen={isSellOpen} setIsOpen={setIsSellOpen} refObj={sellRef} />
           
-          {/* Live price of the token you are paying with */}
-                    {/* Live price of the token you are paying with */}
-          {sellLivePrice > 0 && (
-            <div className="mt-2 px-2 py-1 bg-carbon rounded-md text-[10px] text-granite font-mono flex items-center gap-1.5 w-fit">
-              <span className="w-1.5 h-1.5 rounded-full bg-granite animate-pulse"></span>
-              Market: ${sellLivePrice.toFixed(5)}
-            </div>
-          )}
+                {/* Live price of the token you are paying with */}
+        {sellLivePrice > 0 && (
+          <div className={`mt-2 px-2 py-1 rounded-md text-xs font-mono font-medium flex items-center gap-1.5 w-fit ${action === "SELL" ? "bg-emerald/10 text-emerald" : "bg-carbon text-granite"}`}>
+            <span className={`w-1.5 h-1.5 rounded-full ${action === "SELL" ? "bg-emerald" : "bg-granite"} animate-pulse`}></span>
+            {action === "SELL" ? "Trigger Price" : "Market Price"}: ${sellLivePrice.toFixed(5)}
+          </div>
+        )}
         </div>
 
         <div className="flex justify-center -my-2 relative z-20">
@@ -293,11 +296,12 @@ export function OrderForm({ onOrderCreated }: { onOrderCreated: () => void }) {
           </div>
           <TokenDropdown selected={buyToken} onSelect={setBuyToken} isOpen={isBuyOpen} setIsOpen={setIsBuyOpen} refObj={buyRef} />
 
+                    
                     {/* Live price of the token you are trying to buy */}
           {livePrice > 0 && (
-            <div className="mt-2 px-2 py-1 bg-emerald/10 rounded-md text-xs text-emerald font-mono font-medium flex items-center gap-1.5 w-fit">
-              <span className="w-1.5 h-1.5 rounded-full bg-emerald animate-pulse"></span>
-              Target: ${livePrice.toFixed(5)}
+            <div className={`mt-2 px-2 py-1 rounded-md text-xs font-mono font-medium flex items-center gap-1.5 w-fit ${action === "BUY" ? "bg-emerald/10 text-emerald" : "bg-carbon text-granite"}`}>
+              <span className={`w-1.5 h-1.5 rounded-full ${action === "BUY" ? "bg-emerald" : "bg-granite"} animate-pulse`}></span>
+              {action === "BUY" ? "Trigger Price" : "Target Price"}: ${livePrice.toFixed(5)}
             </div>
           )}
         </div>

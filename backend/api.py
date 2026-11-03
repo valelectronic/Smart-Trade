@@ -106,21 +106,26 @@ class OrderCreate(BaseModel):
         route_token = None
         market = ""
 
+        # Determine which token we are monitoring based on the action
+        if self.action == "BUY":
+            monitor_token = buy_token
+        else:
+            monitor_token = sell_token
+
+        # 1. Try direct pairs first
         if f"{sell_token}-{buy_token}" in valid_symbols:
             market = f"{sell_token}-{buy_token}"
         elif f"{buy_token}-{sell_token}" in valid_symbols:
             market = f"{buy_token}-{sell_token}"
-        elif sell_token == "CC" and f"{buy_token}-CC" in valid_symbols:
-            market = f"{buy_token}-CC"
-        elif buy_token == "CC" and f"{sell_token}-CC" in valid_symbols:
+        elif monitor_token == "CC" and f"{sell_token}-CC" in valid_symbols:
             market = f"{sell_token}-CC"
+        elif monitor_token == "CC" and f"{buy_token}-CC" in valid_symbols:
+            market = f"{buy_token}-CC"
         else:
-            if f"{buy_token}-CC" in valid_symbols:
-                market = f"{buy_token}-CC"
-                route_token = sell_token
-            elif f"{sell_token}-CC" in valid_symbols:
-                market = f"{sell_token}-CC"
-                route_token = buy_token
+            # For two-leg swaps, ALWAYS monitor the token we are trading
+            if f"{monitor_token}-CC" in valid_symbols:
+                market = f"{monitor_token}-CC"
+                route_token = buy_token if self.action == "BUY" else sell_token
             else:
                 raise ValueError(f"Could not find a valid route for {sell_token} to {buy_token} on Cantex.")
 
