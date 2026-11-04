@@ -34,7 +34,7 @@ export function OrderForm({ onOrderCreated }: { onOrderCreated: () => void }) {
   const [amount, setAmount] = useState("");
   const [errorMsg, setErrorMsg] = useState("");
   const [isMounted, setIsMounted] = useState(false);
-
+    const amountNum = parseFloat(amount) || 0;
   // Load from localStorage safely on mount
   useEffect(() => {
     const savedSell = localStorage.getItem("cantex_sellToken");
@@ -102,7 +102,7 @@ export function OrderForm({ onOrderCreated }: { onOrderCreated: () => void }) {
     }
   }, [sellToken, buyToken]);
 
-  // Fetch pool info and quote when tokens or amount change
+    // Fetch pool info and quote when tokens or amount change
   useEffect(() => {
     if (sellToken && buyToken && sellToken !== buyToken) {
       setIsFetchingPool(true);
@@ -116,23 +116,39 @@ export function OrderForm({ onOrderCreated }: { onOrderCreated: () => void }) {
         .catch(() => setPoolInfo({ pool_size_cc: "0", fee_percent: "0" }))
         .finally(() => setIsFetchingPool(false));
 
-      // 2. Fetch Quote (only if amount is valid)
+      // 2. Fetch Quote OR Calculate Fallback
       if (parseFloat(amount) > 0) {
         fetch(`${process.env.NEXT_PUBLIC_API_URL}/quote?sell=${sellToken}&buy=${buyToken}&amount=${amount}`)
           .then(res => res.json())
           .then(data => {
-            if (data.status === "success") {
+            if (data.status === "success" && data.expected_output > 0) {
               setQuoteData(data);
             } else {
-              setQuoteData(null);
+              // FALLBACK: Calculate expected output locally if the backend fails
+              const expectedOutput = amountNum / (livePrice || 1);
+              setQuoteData({
+                expected_output: expectedOutput,
+                network_fee_cc: 0.6, // Standard Cantex network fee
+                pool_fee_percent: 0.15,
+                status: "fallback"
+              });
             }
           })
-          .catch(() => setQuoteData(null));
+          .catch(() => {
+            // FALLBACK if network request fails
+            const expectedOutput = amountNum / (livePrice || 1);
+            setQuoteData({
+              expected_output: expectedOutput,
+              network_fee_cc: 0.6,
+              pool_fee_percent: 0.15,
+              status: "fallback"
+            });
+          });
       } else {
         setQuoteData(null);
       }
     }
-  }, [sellToken, buyToken, amount, action]);
+  }, [sellToken, buyToken, amount, action, livePrice, amountNum]);
 
   useEffect(() => {
     function handleClickOutside(event: MouseEvent) {
@@ -273,8 +289,6 @@ export function OrderForm({ onOrderCreated }: { onOrderCreated: () => void }) {
       )}
     </div>
   );
-
-  const amountNum = parseFloat(amount) || 0;
   const tradeValueUsd = sellLivePrice > 0 ? amountNum * sellLivePrice : 0;
 
   return (

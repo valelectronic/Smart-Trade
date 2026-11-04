@@ -276,7 +276,7 @@ async def get_quote(sell: str, buy: str, amount: str):
                 instruments[str(symbol).upper()] = instrument
                 
         if s not in instruments or b not in instruments:
-            return {"error": "Missing SDK instrument"}
+            return {"error": "Missing SDK instrument", "status": "failed"}
             
         quote = await client.get_swap_quote(
             sell_amount=sell_amount,
@@ -290,11 +290,29 @@ async def get_quote(sell: str, buy: str, amount: str):
             if asyncio.iscoroutine(result):
                 await result
                 
-        # Extract data from quote
-        output = float(quote.get("returned", {}).get("amount", 0))
-        network_fee = float(quote.get("fees", {}).get("network_fee", {}).get("amount", 0))
-        pool_fee = float(quote.get("fees", {}).get("fee_percentage", 0))
-        
+        # --- FIXED: Use attribute access, not .get() ---
+        # The SDK returns an object, not a dict.
+        output = 0.0
+        network_fee = 0.0
+        pool_fee = 0.0
+
+        try:
+            # Attempt to read from the returned object
+            returned_obj = getattr(quote, "returned", None)
+            if returned_obj is not None:
+                output = float(getattr(returned_obj, "amount", 0))
+
+            fees_obj = getattr(quote, "fees", None)
+            if fees_obj is not None:
+                net_fee_obj = getattr(fees_obj, "network_fee", None)
+                if net_fee_obj is not None:
+                    network_fee = float(getattr(net_fee_obj, "amount", 0))
+                
+                pool_fee = float(getattr(fees_obj, "fee_percentage", 0))
+
+        except Exception as parse_err:
+            print(f"[QUOTE PARSE ERROR] {parse_err}")
+
         return {
             "expected_output": output,
             "network_fee_cc": network_fee,
@@ -303,7 +321,6 @@ async def get_quote(sell: str, buy: str, amount: str):
         }
     except Exception as e:
         return {"error": str(e), "status": "failed"}
-
 
 @app.post("/api/subscribe")
 async def subscribe_market(market: str):

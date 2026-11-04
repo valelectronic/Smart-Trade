@@ -32,35 +32,67 @@ export default function Home() {
     }
   }, [activeTab, isMounted]);
 
-  // Fetch Total Portfolio Value
+    // Fetch Total Portfolio Value (Optimized)
   useEffect(() => {
+    let isCancelled = false;
+
     const fetchPortfolioValue = async () => {
       setIsFetchingValue(true);
+      
+      // Timeout safety: if it takes more than 6 seconds, stop
+      const timeoutId = setTimeout(() => {
+        if (!isCancelled) setIsFetchingValue(false);
+      }, 6000);
+
       try {
         const balances = await getBalances();
-        let total = 0;
         
-        for (const [token, amount] of Object.entries(balances)) {
-          const bal = parseFloat(amount);
-          if (bal > 0) {
+        // Filter only tokens with a balance > 0
+        const tokensWithBalance = Object.entries(balances).filter(
+          ([_, amount]) => parseFloat(amount) > 0
+        );
+
+        if (tokensWithBalance.length === 0) {
+          if (!isCancelled) setTotalPortfolioValue(0);
+          return;
+        }
+
+        // Fetch all prices in parallel (fast)
+        const pricePromises = tokensWithBalance.map(async ([token, amount]) => {
+          try {
             const priceData = await getLivePrice(token, "USDC");
             if (priceData.price && priceData.price !== "0") {
-              total += bal * parseFloat(priceData.price);
+              return parseFloat(amount) * parseFloat(priceData.price);
             }
+          } catch (e) {
+            // Ignore individual token errors
           }
+          return 0;
+        });
+
+        const results = await Promise.all(pricePromises);
+        const total = results.reduce((sum, val) => sum + val, 0);
+
+        if (!isCancelled) {
+          setTotalPortfolioValue(total);
         }
-        setTotalPortfolioValue(total);
       } catch (err) {
         console.error("Failed to calculate portfolio value", err);
       } finally {
-        setIsFetchingValue(false);
+        clearTimeout(timeoutId);
+        if (!isCancelled) setIsFetchingValue(false);
       }
     };
     
     fetchPortfolioValue();
-    // Refresh every 30 seconds to keep it up to date
-    const interval = setInterval(fetchPortfolioValue, 30000);
-    return () => clearInterval(interval);
+    
+    // Refresh every 60 seconds (saves Railway usage)
+    const interval = setInterval(fetchPortfolioValue, 60000);
+    
+    return () => {
+      isCancelled = true;
+      clearInterval(interval);
+    };
   }, []);
 
   const handleOrderCreated = () => {
