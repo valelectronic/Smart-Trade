@@ -4,12 +4,17 @@ import { useState, useEffect } from "react";
 import { OrderForm } from "@/components/orderForm";
 import { OrderTable } from "@/components/orderTable";
 import { MarketBar } from "@/components/marketBar"; 
-import { Wallet, Activity, Bell, Home as HomeIcon, PlusCircle, List } from "lucide-react";
+import { getBalances, getLivePrice } from "@/lib/api"; // <-- Import these
+import { Wallet, Activity, Bell, PlusCircle, List, TrendingUp } from "lucide-react";
 
 export default function Home() {
   const [refreshTrigger, setRefreshTrigger] = useState(0);
   const [activeTab, setActiveTab] = useState<"create" | "orders">("create");
   const [isMounted, setIsMounted] = useState(false);
+  
+  // Portfolio Value State
+  const [totalPortfolioValue, setTotalPortfolioValue] = useState<number>(0);
+  const [isFetchingValue, setIsFetchingValue] = useState(false);
 
   // Load saved tab safely after mounting
   useEffect(() => {
@@ -26,6 +31,37 @@ export default function Home() {
       localStorage.setItem("cantex_activeTab", activeTab);
     }
   }, [activeTab, isMounted]);
+
+  // Fetch Total Portfolio Value
+  useEffect(() => {
+    const fetchPortfolioValue = async () => {
+      setIsFetchingValue(true);
+      try {
+        const balances = await getBalances();
+        let total = 0;
+        
+        for (const [token, amount] of Object.entries(balances)) {
+          const bal = parseFloat(amount);
+          if (bal > 0) {
+            const priceData = await getLivePrice(token, "USDC");
+            if (priceData.price && priceData.price !== "0") {
+              total += bal * parseFloat(priceData.price);
+            }
+          }
+        }
+        setTotalPortfolioValue(total);
+      } catch (err) {
+        console.error("Failed to calculate portfolio value", err);
+      } finally {
+        setIsFetchingValue(false);
+      }
+    };
+    
+    fetchPortfolioValue();
+    // Refresh every 30 seconds to keep it up to date
+    const interval = setInterval(fetchPortfolioValue, 30000);
+    return () => clearInterval(interval);
+  }, []);
 
   const handleOrderCreated = () => {
     setRefreshTrigger((p) => p + 1);
@@ -69,21 +105,34 @@ export default function Home() {
       </div>
 
       {/* Main Content */}
-      <main className="flex-1 max-w-5xl w-full mx-auto p-4 md:p-8 pb-24 md:pb-8 overflow-x-hidden">
+      <main className="flex-1 max-w-5xl w-full mx-auto p-4 md:p-8 pb-24 md:pb-8">
         
+        {/* --- NEW: TOTAL PORTFOLIO VALUE CARD --- */}
+        <div className="bg-carbon border border-jet-black rounded-2xl p-5 mb-6 flex items-center justify-between">
+          <div>
+            <p className="text-xs text-granite mb-1 uppercase tracking-wider font-semibold">Estimated Total Value</p>
+            <h2 className="text-3xl font-bold text-snow font-mono">
+              {isFetchingValue ? "..." : `$${totalPortfolioValue.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })} USD`}
+            </h2>
+          </div>
+          <div className="p-3 bg-emerald/10 rounded-xl">
+            <TrendingUp size={24} className="text-emerald" />
+          </div>
+        </div>
+
         {/* Header & Tabs */}
-        <div className="mb-6 flex flex-col md:flex-row md:items-end justify-between gap-4 mt-4">
+        <div className="mb-6 flex flex-col md:flex-row md:items-end justify-between gap-4">
           <div>
             <h1 className="text-xl md:text-2xl font-medium text-snow mb-1">Trading Dashboard</h1>
             <p className="text-granite text-sm">Manage your semi-automated strategies.</p>
           </div>
 
           {/* Tab Switcher */}
-          <div className="flex bg-carbon p-1 rounded-lg border border-jet-black w-full md:w-auto">
+          <div className="flex bg-carbon p-1 rounded-xl border border-jet-black w-full md:w-auto">
             <button
               onClick={() => setActiveTab("create")}
-              className={`flex-1 md:flex-none flex items-center justify-center gap-2 px-6 py-2 text-sm font-medium rounded-md transition-all ${
-                activeTab === "create" ? "bg-jet-black text-emerald" : "text-granite hover:text-snow"
+              className={`flex-1 md:flex-none flex items-center justify-center gap-2 px-6 py-2 text-sm font-medium rounded-lg transition-all ${
+                activeTab === "create" ? "bg-jet-black text-emerald shadow-sm" : "text-granite hover:text-snow"
               }`}
             >
               <PlusCircle size={16} />
@@ -91,8 +140,8 @@ export default function Home() {
             </button>
             <button
               onClick={() => setActiveTab("orders")}
-              className={`flex-1 md:flex-none flex items-center justify-center gap-2 px-6 py-2 text-sm font-medium rounded-md transition-all ${
-                activeTab === "orders" ? "bg-jet-black text-emerald" : "text-granite hover:text-snow"
+              className={`flex-1 md:flex-none flex items-center justify-center gap-2 px-6 py-2 text-sm font-medium rounded-lg transition-all ${
+                activeTab === "orders" ? "bg-jet-black text-emerald shadow-sm" : "text-granite hover:text-snow"
               }`}
             >
               <List size={16} />

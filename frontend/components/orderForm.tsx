@@ -5,7 +5,7 @@ import { toast } from "sonner";
 import { createOrder, getMarkets, getBalances, getLivePrice } from "@/lib/api";
 import { Card } from "./ui/card";
 import { Button } from "./ui/Button";
-import { ChevronDown, Check, ArrowUpDown, AlertCircle } from "lucide-react";
+import { ChevronDown, ArrowUpDown, AlertCircle, Info, Clock, ShieldCheck } from "lucide-react";
 import { PriceTicker } from "./priceTicker";
 
 export function OrderForm({ onOrderCreated }: { onOrderCreated: () => void }) {
@@ -14,15 +14,18 @@ export function OrderForm({ onOrderCreated }: { onOrderCreated: () => void }) {
   const [balances, setBalances] = useState<Record<string, string>>({});
   
   // Prices
-  const [livePrice, setLivePrice] = useState<number>(0);      // Price of BUY token
-  const [sellLivePrice, setSellLivePrice] = useState<number>(0); // Price of SELL token
+  const [livePrice, setLivePrice] = useState<number>(0);      
+  const [sellLivePrice, setSellLivePrice] = useState<number>(0); 
   
+  // Pool Info
+  const [poolInfo, setPoolInfo] = useState<{ pool_size_cc: string; fee_percent: string }>({ pool_size_cc: "0", fee_percent: "0" });
+  const [isFetchingPool, setIsFetchingPool] = useState(false);
+
   const [isSellOpen, setIsSellOpen] = useState(false);
   const [isBuyOpen, setIsBuyOpen] = useState(false);
   const sellRef = useRef<HTMLDivElement>(null);
   const buyRef = useRef<HTMLDivElement>(null);
 
-  // State declarations (start empty to prevent hydration mismatch)
   const [sellToken, setSellToken] = useState<string>("");
   const [buyToken, setBuyToken] = useState<string>("");
   const [action, setAction] = useState<"BUY" | "SELL">("SELL");
@@ -80,7 +83,6 @@ export function OrderForm({ onOrderCreated }: { onOrderCreated: () => void }) {
       setAvailableTokens(tokens);
       setBalances(upperBalances);
       
-      // Only set defaults if we don't have saved tokens
       setSellToken(prev => prev || tokens[0]);
       setBuyToken(prev => prev || tokens[1] || tokens[0]);
     }).catch(() => toast.error("Could not load market data."));
@@ -89,17 +91,29 @@ export function OrderForm({ onOrderCreated }: { onOrderCreated: () => void }) {
   // Fetch live prices for BOTH tokens
   useEffect(() => {
     if (sellToken && buyToken && sellToken !== buyToken) {
-      // 1. Fetch price of the BUY token (what we are monitoring)
       getLivePrice(buyToken, "USDC").then(data => {
         setLivePrice(data.price && data.price !== "0" ? parseFloat(data.price) : 0);
       }).catch(() => setLivePrice(0));
 
-      // 2. Fetch price of the SELL token (what we are paying)
       getLivePrice(sellToken, "USDC").then(data => {
         setSellLivePrice(data.price && data.price !== "0" ? parseFloat(data.price) : 0);
       }).catch(() => setSellLivePrice(0));
     }
   }, [sellToken, buyToken]);
+
+  // Fetch pool info when tokens change
+  useEffect(() => {
+    if (sellToken && buyToken && sellToken !== buyToken) {
+      setIsFetchingPool(true);
+      fetch(`${process.env.NEXT_PUBLIC_API_URL}/pool-info?sell=${sellToken}&buy=${buyToken}&action=${action}`)
+        .then(res => res.json())
+        .then(data => {
+          setPoolInfo({ pool_size_cc: data.pool_size_cc || "0", fee_percent: data.fee_percent || "0" });
+        })
+        .catch(() => setPoolInfo({ pool_size_cc: "0", fee_percent: "0" }))
+        .finally(() => setIsFetchingPool(false));
+    }
+  }, [sellToken, buyToken, action]);
 
   useEffect(() => {
     function handleClickOutside(event: MouseEvent) {
@@ -118,7 +132,7 @@ export function OrderForm({ onOrderCreated }: { onOrderCreated: () => void }) {
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-     if (isLoading) return;
+    if (isLoading) return;
     setErrorMsg("");
 
     if (sellToken === buyToken) {
@@ -139,17 +153,7 @@ export function OrderForm({ onOrderCreated }: { onOrderCreated: () => void }) {
       return;
     }
 
-           const priceInput = parseFloat(triggerPrice);
-    
-    // Cantex requires a minimum of 100 CC for CC trades.
-    // For other tokens, the backend/SDK will enforce the pool minimum.
-    if (sellToken === "CC" && requestedAmount < 100) {
-      setErrorMsg("Minimum trade size is 100 CC.");
-      return;
-    }
-
-
-        // Determine which token we are monitoring for the trigger
+    const priceInput = parseFloat(triggerPrice);
     const monitorToken = action === "BUY" ? buyToken : sellToken;
     let freshPrice = action === "BUY" ? livePrice : sellLivePrice;
 
@@ -217,7 +221,7 @@ export function OrderForm({ onOrderCreated }: { onOrderCreated: () => void }) {
   };
 
   const Label = ({ children }: { children: React.ReactNode }) => (
-    <label className="block text-xs font-semibold text-granite uppercase tracking-wider mb-2">
+    <label className="block text-xs font-semibold text-granite uppercase tracking-wider mb-1.5">
       {children}
     </label>
   );
@@ -227,14 +231,14 @@ export function OrderForm({ onOrderCreated }: { onOrderCreated: () => void }) {
       <button
         type="button"
         onClick={() => setIsOpen(!isOpen)}
-        className="w-full bg-carbon border border-jet-black rounded-lg p-3 text-snow font-mono text-sm flex justify-between items-center focus:ring-1 focus:ring-emerald outline-none truncate"
+        className="w-full bg-carbon border border-jet-black rounded-xl p-3 text-snow font-mono text-sm flex justify-between items-center focus:ring-1 focus:ring-emerald outline-none truncate"
       >
         <span className="truncate">{selected || "Select Token..."}</span>
         <ChevronDown size={16} className="text-granite shrink-0" />
       </button>
 
       {isOpen && (
-        <div className="absolute top-full left-0 mt-1 w-full max-h-60 overflow-y-auto bg-carbon border border-jet-black rounded-lg shadow-xl z-50">
+        <div className="absolute top-full left-0 mt-1 w-full max-h-60 overflow-y-auto bg-carbon border border-jet-black rounded-xl shadow-xl z-50">
           {availableTokens.map((t) => (
             <button
               key={t}
@@ -251,113 +255,149 @@ export function OrderForm({ onOrderCreated }: { onOrderCreated: () => void }) {
     </div>
   );
 
+  const amountNum = parseFloat(amount) || 0;
+  const tradeValueUsd = sellLivePrice > 0 ? amountNum * sellLivePrice : 0;
+  const buyValueUsd = livePrice > 0 ? amountNum * livePrice : 0;
+
   return (
-    <Card className="bg-onyx border-shadow-grey relative z-10">
-      <div className="flex items-center justify-between mb-6 pb-4 border-b border-jet-black">
-        <h2 className="text-lg font-medium text-snow">New Trade Alert</h2>
+    <Card className="bg-onyx border-shadow-grey relative z-10 w-full max-w-lg mx-auto">
+      <div className="flex items-center justify-between mb-4 pb-3 border-b border-jet-black">
+        <h2 className="text-base font-semibold text-snow">New Trade Alert</h2>
         <div className="h-2 w-2 rounded-full bg-emerald shadow-[0_0_8px_rgba(34,220,149,0.8)] animate-pulse" />
       </div>
 
       <PriceTicker sellToken={sellToken} buyToken={buyToken} action={action} />
       
-      <form onSubmit={handleSubmit} className="space-y-5">
+      <form onSubmit={handleSubmit} className="space-y-4 mt-4">
         
-        <div>
-          <div className="flex justify-between items-end mb-2">
-            <Label>You Pay (Sell)</Label>
-            <span className="text-xs text-granite">Bal: {balances[sellToken] ? parseFloat(balances[sellToken]).toFixed(4) : "0.00"}</span>
-          </div>
-          <TokenDropdown selected={sellToken} onSelect={setSellToken} isOpen={isSellOpen} setIsOpen={setIsSellOpen} refObj={sellRef} />
+        {/* SWAP BOX (Cantex Style) */}
+        <div className="bg-carbon rounded-2xl p-3 border border-jet-black relative">
           
-                {/* Live price of the token you are paying with */}
-        {sellLivePrice > 0 && (
-          <div className={`mt-2 px-2 py-1 rounded-md text-xs font-mono font-medium flex items-center gap-1.5 w-fit ${action === "SELL" ? "bg-emerald/10 text-emerald" : "bg-carbon text-granite"}`}>
-            <span className={`w-1.5 h-1.5 rounded-full ${action === "SELL" ? "bg-emerald" : "bg-granite"} animate-pulse`}></span>
-            {action === "SELL" ? "Trigger Price" : "Market Price"}: ${sellLivePrice.toFixed(5)}
+          {/* YOU PAY */}
+          <div className="mb-2">
+            <div className="flex justify-between items-center mb-1">
+              <Label>You Pay</Label>
+              <span className="text-xs text-granite cursor-pointer hover:text-snow" onClick={() => setAmount(balances[sellToken] || "0")}>
+                Bal: {balances[sellToken] ? parseFloat(balances[sellToken]).toFixed(4) : "0.00"} (Max)
+              </span>
+            </div>
+            <div className="flex items-center gap-2">
+              <div className="w-1/2">
+                <TokenDropdown selected={sellToken} onSelect={setSellToken} isOpen={isSellOpen} setIsOpen={setIsSellOpen} refObj={sellRef} />
+              </div>
+              <div className="w-1/2 relative">
+                <input 
+                  type="number" step="any" required placeholder="0.00"
+                  className="w-full bg-onyx border border-jet-black rounded-xl p-3 text-snow font-mono text-right text-lg focus:ring-1 focus:ring-emerald outline-none"
+                  value={amount} onChange={(e) => setAmount(e.target.value)}
+                />
+                <div className="text-[10px] text-granite text-right mt-1 pr-1">
+                  ~${tradeValueUsd.toFixed(2)} USD
+                </div>
+              </div>
+            </div>
           </div>
-        )}
+
+          {/* SWAP ARROW */}
+          <div className="absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 z-20">
+            <button 
+              type="button"
+              onClick={handleSwapTokens}
+              className="bg-jet-black p-1.5 rounded-full border border-shadow-grey hover:border-emerald hover:text-emerald transition-colors text-granite shadow-lg cursor-pointer"
+            >
+              <ArrowUpDown size={14} />
+            </button>
+          </div>
+
+          {/* YOU RECEIVE */}
+          <div className="mt-4 pt-4 border-t border-jet-black/50">
+            <div className="flex justify-between items-center mb-1">
+              <Label>You Receive</Label>
+              <span className="text-xs text-granite">
+                Bal: {balances[buyToken] ? parseFloat(balances[buyToken]).toFixed(4) : "0.00"}
+              </span>
+            </div>
+            <div className="flex items-center gap-2">
+              <div className="w-1/2">
+                <TokenDropdown selected={buyToken} onSelect={setBuyToken} isOpen={isBuyOpen} setIsOpen={setIsBuyOpen} refObj={buyRef} />
+              </div>
+              <div className="w-1/2 relative">
+                 <div className="w-full bg-onyx border border-jet-black rounded-xl p-3 text-snow font-mono text-right text-lg text-granite">
+                   ~ {amount ? (amountNum / (livePrice || 1)).toFixed(4) : "0.00"}
+                 </div>
+                 <div className="text-[10px] text-emerald text-right mt-1 pr-1">
+                  {livePrice > 0 ? `Target: $${livePrice.toFixed(5)}` : "Price Unavailable"}
+                </div>
+              </div>
+            </div>
+          </div>
         </div>
 
-        <div className="flex justify-center -my-2 relative z-20">
-          <button 
+        {/* ACTION TOGGLE */}
+        <div className="flex bg-carbon p-1 rounded-xl border border-jet-black">
+          <button
             type="button"
-            onClick={handleSwapTokens}
-            className="bg-jet-black p-2 rounded-full border border-shadow-grey hover:border-emerald hover:text-emerald transition-colors text-granite shadow-lg cursor-pointer"
-            title="Swap Pay/Receive"
+            onClick={() => setAction("BUY")}
+            className={`flex-1 py-2 text-xs font-semibold rounded-lg transition-all ${action === "BUY" ? "bg-emerald/20 text-emerald" : "text-granite hover:text-snow"}`}
           >
-            <ArrowUpDown size={16} />
+            BUY DIP
+          </button>
+          <button
+            type="button"
+            onClick={() => setAction("SELL")}
+            className={`flex-1 py-2 text-xs font-semibold rounded-lg transition-all ${action === "SELL" ? "bg-red-500/20 text-red-400" : "text-granite hover:text-snow"}`}
+          >
+            SELL RISE
           </button>
         </div>
 
+        {/* TRIGGER PRICE */}
         <div>
-          <div className="flex justify-between items-end mb-2">
-            <Label>You Receive (Buy)</Label>
-            <span className="text-xs text-granite">Bal: {balances[buyToken] ? parseFloat(balances[buyToken]).toFixed(4) : "0.00"}</span>
-          </div>
-          <TokenDropdown selected={buyToken} onSelect={setBuyToken} isOpen={isBuyOpen} setIsOpen={setIsBuyOpen} refObj={buyRef} />
-
-                    
-                    {/* Live price of the token you are trying to buy */}
-          {livePrice > 0 && (
-            <div className={`mt-2 px-2 py-1 rounded-md text-xs font-mono font-medium flex items-center gap-1.5 w-fit ${action === "BUY" ? "bg-emerald/10 text-emerald" : "bg-carbon text-granite"}`}>
-              <span className={`w-1.5 h-1.5 rounded-full ${action === "BUY" ? "bg-emerald" : "bg-granite"} animate-pulse`}></span>
-              {action === "BUY" ? "Trigger Price" : "Target Price"}: ${livePrice.toFixed(5)}
-            </div>
-          )}
+          <Label>Trigger Price (USD)</Label>
+          <input 
+            type="number" step="any" required 
+            placeholder={
+              action === "BUY" 
+                ? (livePrice > 0 ? `~${livePrice.toFixed(5)}` : "0.00")
+                : (sellLivePrice > 0 ? `~${sellLivePrice.toFixed(5)}` : "0.00")
+            }
+            className="w-full bg-carbon border border-jet-black rounded-xl p-3 text-snow font-mono text-sm focus:ring-1 focus:ring-emerald outline-none"
+            value={triggerPrice} onChange={(e) => setTriggerPrice(e.target.value)}
+          />
         </div>
 
-        <div className="pt-2">
-          <Label>Action</Label>
-          <div className="flex bg-carbon p-1 rounded-lg border border-jet-black">
-            <button
-              type="button"
-              onClick={() => setAction("BUY")}
-              className={`flex-1 py-2 text-sm font-medium rounded-md transition-all ${action === "BUY" ? "bg-emerald/20 text-emerald" : "text-granite hover:text-snow"}`}
-            >
-              BUY DIP
-            </button>
-            <button
-              type="button"
-              onClick={() => setAction("SELL")}
-              className={`flex-1 py-2 text-sm font-medium rounded-md transition-all ${action === "SELL" ? "bg-red-500/20 text-red-400" : "text-granite hover:text-snow"}`}
-            >
-              SELL RISE
-            </button>
+        {/* TRADE DETAILS (Cantex Style) */}
+        <div className="bg-carbon/50 rounded-xl p-3 border border-jet-black space-y-1.5 mt-2">
+          <div className="flex justify-between items-center">
+            <span className="text-[11px] text-granite flex items-center gap-1">
+              <ShieldCheck size={12} /> Pool Size
+            </span>
+            <span className="text-[11px] text-snow font-mono">
+              {isFetchingPool ? "..." : `${parseFloat(poolInfo.pool_size_cc).toLocaleString(undefined, { maximumFractionDigits: 0 })} CC`}
+            </span>
           </div>
-        </div>
+          
+          <div className="flex justify-between items-center">
+            <span className="text-[11px] text-granite">Pool Fee</span>
+            <span className="text-[11px] text-snow font-mono">{poolInfo.fee_percent}%</span>
+          </div>
 
-        <div className="grid grid-cols-2 gap-4">
-          <div>
-            <Label>Trigger Price (USD)</Label>
-                    <input 
-          type="number" step="any" required 
-          placeholder={
-            action === "BUY" 
-              ? (livePrice > 0 ? `~${livePrice.toFixed(5)}` : "0.00")
-              : (sellLivePrice > 0 ? `~${sellLivePrice.toFixed(5)}` : "0.00")
-          }
-          className="w-full bg-carbon border border-jet-black rounded-lg p-3 text-snow font-mono text-sm focus:ring-1 focus:ring-emerald outline-none"
-          value={triggerPrice} onChange={(e) => setTriggerPrice(e.target.value)}
-        />
-          </div>
-          <div>
-            <Label>Amount ({sellToken || '...'})</Label>
-            <input 
-              type="number" step="any" required placeholder="0.00"
-              className="w-full bg-carbon border border-jet-black rounded-lg p-3 text-snow font-mono text-sm focus:ring-1 focus:ring-emerald outline-none"
-              value={amount} onChange={(e) => setAmount(e.target.value)}
-            />
+          <div className="flex justify-between items-center">
+            <span className="text-[11px] text-granite flex items-center gap-1">
+              <Clock size={12} /> Est. Time
+            </span>
+            <span className="text-[11px] text-snow font-mono">~10-25s</span>
           </div>
         </div>
 
         {errorMsg && (
-          <div className="flex items-center gap-2 text-red-400 text-sm bg-red-500/10 p-3 rounded-lg border border-red-500/20">
-            <AlertCircle size={16} />
+          <div className="flex items-start gap-2 text-red-400 text-xs bg-red-500/10 p-3 rounded-xl border border-red-500/20">
+            <AlertCircle size={14} className="mt-0.5 shrink-0" />
             <span>{errorMsg}</span>
           </div>
         )}
 
-        <Button type="submit" isLoading={isLoading} className="w-full mt-4 py-3">
+        <Button type="submit" isLoading={isLoading} className="w-full mt-2 py-3 rounded-xl font-semibold">
           Create Alert Order
         </Button>
       </form>

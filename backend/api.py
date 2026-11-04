@@ -213,6 +213,46 @@ def get_price(sell: str, buy: str):
         return {"error": str(e), "price": "0"}
 
 
+
+@app.get("/api/pool-info")
+def get_pool_info(sell: str, buy: str, action: str = "BUY"):
+    try:
+        s = sell.upper()
+        b = buy.upper()
+        
+        # Determine which market the engine will monitor
+        if action.upper() == "BUY":
+            monitor_token = b
+        else:
+            monitor_token = s
+
+        # Determine the market to check (e.g., TOKEN-CC)
+        if monitor_token == "CC":
+            market = f"{b}-CC" if s == "CC" else f"{s}-CC"
+        else:
+            market = f"{monitor_token}-CC"
+
+        # 1. Fetch the live pool state from Cantex
+        response = requests.get(f"{PUBLIC_BASE}/pools/state", timeout=10)
+        response.raise_for_status()
+        pools = response.json().get("data", {}).get("pools", [])
+        
+        # 2. Find the specific pool
+        for pool in pools:
+            if pool.get("symbol") == market:
+                # Cantex returns the pool size in CC
+                pool_size = pool.get("reserves", {}).get("CC", "0")
+                return {
+                    "market": market,
+                    "pool_size_cc": pool_size,
+                    "fee_percent": pool.get("fee_percent", "0.15")
+                }
+        
+        return {"error": f"Pool {market} not found", "pool_size_cc": "0", "fee_percent": "0"}
+    except Exception as e:
+        return {"error": str(e), "pool_size_cc": "0", "fee_percent": "0"}
+
+
 @app.post("/api/subscribe")
 async def subscribe_market(market: str):
     """Tell the monitor to start tracking this market."""
