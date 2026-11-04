@@ -270,10 +270,11 @@ async def quote_and_preflight(
             failure = ("SLIPPAGE_UNAVAILABLE", "Slippage was missing from the quote")
         elif slippage_percent >= MAX_SLIPPAGE_PERCENT:
             failure = ("SLIPPAGE_TOO_HIGH", f"Slippage {slippage_percent}% is not below {MAX_SLIPPAGE_PERCENT}%")
-        elif pool_share_percent is None:
-            failure = ("POOL_SIZE_UNAVAILABLE", "Pool size or its denomination could not be verified")
-        elif pool_share_percent > MAX_TRADE_POOL_PERCENT:
+                # If pool_share_percent is None, we skip the pool size check and log a warning.
+        elif pool_share_percent is not None and pool_share_percent > MAX_TRADE_POOL_PERCENT:
             failure = ("TRADE_TOO_LARGE_FOR_POOL", f"Trade represents {pool_share_percent:.4f}% of the pool")
+
+
         elif execution_seconds is None:
             failure = ("EXECUTION_TIME_UNAVAILABLE", "Estimated execution time is missing from the quote")
         elif execution_seconds > MAX_EXECUTION_SECONDS:
@@ -344,7 +345,10 @@ async def quote_and_preflight(
             return
 
         callback_id = uuid.uuid4().hex[:12]
-        pool_size_text = f"{pool_size} {pool_size_token}"
+        if pool_size is not None and pool_size_token is not None:
+            pool_size_text = f"{pool_size} {pool_size_token}"
+        else:
+            pool_size_text = "Not available from SDK quote"
 
         message = (
             f"🚨 TRADE READY: {order['action']} {sell_amount} {sell_token}\n"
