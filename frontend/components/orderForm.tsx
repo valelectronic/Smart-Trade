@@ -329,11 +329,16 @@ export function OrderForm({ onOrderCreated }: { onOrderCreated: () => void }) {
         <div className="grid grid-cols-2 gap-4">
           <div>
             <Label>Trigger Price (USD)</Label>
-            <input 
-              type="number" step="any" required placeholder={livePrice > 0 ? `~${livePrice.toFixed(5)}` : "0.00"}
-              className="w-full bg-carbon border border-jet-black rounded-lg p-3 text-snow font-mono text-sm focus:ring-1 focus:ring-emerald outline-none"
-              value={triggerPrice} onChange={(e) => setTriggerPrice(e.target.value)}
-            />
+                    <input 
+          type="number" step="any" required 
+          placeholder={
+            action === "BUY" 
+              ? (livePrice > 0 ? `~${livePrice.toFixed(5)}` : "0.00")
+              : (sellLivePrice > 0 ? `~${sellLivePrice.toFixed(5)}` : "0.00")
+          }
+          className="w-full bg-carbon border border-jet-black rounded-lg p-3 text-snow font-mono text-sm focus:ring-1 focus:ring-emerald outline-none"
+          value={triggerPrice} onChange={(e) => setTriggerPrice(e.target.value)}
+        />
           </div>
           <div>
             <Label>Amount ({sellToken || '...'})</Label>
