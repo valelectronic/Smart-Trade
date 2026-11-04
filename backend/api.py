@@ -190,40 +190,37 @@ def get_price(sell: str, buy: str):
             
         prices_file = Path(__file__).parent / "prices.json"
         
-        if not prices_file.exists():
-            return {"error": "Price data not ready yet", "price": "0"}
+        if prices_file.exists():
+            with prices_file.open("r") as f:
+                prices = json.load(f)
+                
+            # 2. Exact match found
+            if market in prices:
+                return {"market": market, "price": prices[market]}
             
-        with prices_file.open("r") as f:
-            prices = json.load(f)
-            
-        # 2. Exact match found
-        if market in prices:
-            return {"market": market, "price": prices[market]}
-        
-        # 3. Fallback: If asking for USD but only CC pair exists, convert it
-        if b in {"USD", "USDC"}:
-            cc_market = f"{s}-CC"
-            if cc_market in prices:
-                cc_rate_key = "CC-USDC"
-                if cc_rate_key in prices:
+            # 3. Fallback: If asking for USD but only CC pair exists, convert it
+            if b in {"USD", "USDC"}:
+                cc_market = f"{s}-CC"
+                if cc_market in prices and "CC-USDC" in prices:
                     try:
-                        cc_rate = Decimal(prices[cc_rate_key])
+                        cc_rate = Decimal(prices["CC-USDC"])
                         token_in_cc = Decimal(prices[cc_market])
                         usd_price = token_in_cc * cc_rate
                         return {"market": cc_market, "price": str(usd_price), "converted_from_cc": True}
                     except Exception:
                         pass
         
-        # 4. Fallback: Try reversed direction
-        if s != "CC" and b == "CC":
-            reversed_market = f"CC-{s}"
-            if reversed_market in prices:
-                return {"market": reversed_market, "price": prices[reversed_market]}
-                
-        if b in {"USD", "USDC"}:
-            reversed_market = f"{b}-{s}"
-            if reversed_market in prices:
-                return {"market": reversed_market, "price": prices[reversed_market]}
+        # 4. LIVE FALLBACK: If not in file, fetch from Cantex directly
+        try:
+            response = requests.get(f"{PUBLIC_BASE}/markets/info", timeout=5)
+            response.raise_for_status()
+            markets = response.json().get("data", {}).get("markets", [])
+            
+            for m in markets:
+                if m.get("symbol") == market:
+                    return {"market": market, "price": str(m.get("price", "0"))}
+        except Exception:
+            pass
             
         return {"error": f"No live price for {market} yet", "price": "0"}
     except Exception as e:
@@ -232,7 +229,7 @@ def get_price(sell: str, buy: str):
 
 
 @app.get("/api/pool-info")
-def get_pool_info(sell: str, buy: str, action: str = "BUY"):
+async def get_pool_info(sell: str, buy: str, action: str = "BUY"):
     try:
         s = sell.upper()
         b = buy.upper()
@@ -240,19 +237,40 @@ def get_pool_info(sell: str, buy: str, action: str = "BUY"):
         monitor_token = b if action.upper() == "BUY" else s
         market = f"{monitor_token}-CC"
 
-        response = requests.get(f"{PUBLIC_BASE}/pools/state", timeout=10)
-        response.raise_for_status()
-        pools = response.json().get("data", {}).get("pools", [])
+        # 1. Try Cantex API
+        try:
+            response = requests.get(f"{PUBLIC_BASE}/pools/state", timeout=5)
+            response.raise_for_status()
+            pools = response.json().get("data", {}).get("pools", [])
+            
+            for pool in pools:
+                if pool.get("symbol") == market:
+                    return {
+                        "market": market,
+                        "pool_size_cc": pool.get("reserves", {}).get("CC", "0"),
+                        "fee_percent": pool.get("fee_percent", "0.15")
+                    }
+        except Exception:
+            pass
+
+        # 2. Fallback: Use SDK to get pool size
+        client = await connect_sdk()
+        account_admin = await client.get_account_admin()
+        instruments = {}
+        for item in getattr(account_admin, "instruments", []) or []:
+            symbol = getattr(item, "instrument_symbol", None)
+            instrument = getattr(item, "instrument", None)
+            if symbol and instrument is not None:
+                instruments[str(symbol).upper()] = instrument
         
-        for pool in pools:
-            if pool.get("symbol") == market:
-                pool_size = pool.get("reserves", {}).get("CC", "0")
-                return {
-                    "market": market,
-                    "pool_size_cc": pool_size,
-                    "fee_percent": pool.get("fee_percent", "0.15")
-                }
-        
+        if monitor_token in instruments:
+            # If we can't get exact pool size, return a placeholder
+            return {
+                "market": market,
+                "pool_size_cc": "Unavailable", 
+                "fee_percent": "0.15"
+            }
+
         return {"error": f"Pool {market} not found", "pool_size_cc": "0", "fee_percent": "0"}
     except Exception as e:
         return {"error": str(e), "pool_size_cc": "0", "fee_percent": "0"}
@@ -290,14 +308,13 @@ async def get_quote(sell: str, buy: str, amount: str):
             if asyncio.iscoroutine(result):
                 await result
                 
-        # --- FIXED: Use attribute access, not .get() ---
-        # The SDK returns an object, not a dict.
+        # Extract data safely
         output = 0.0
         network_fee = 0.0
         pool_fee = 0.0
+        exec_time = 0.0
 
         try:
-            # Attempt to read from the returned object
             returned_obj = getattr(quote, "returned", None)
             if returned_obj is not None:
                 output = float(getattr(returned_obj, "amount", 0))
@@ -307,8 +324,12 @@ async def get_quote(sell: str, buy: str, amount: str):
                 net_fee_obj = getattr(fees_obj, "network_fee", None)
                 if net_fee_obj is not None:
                     network_fee = float(getattr(net_fee_obj, "amount", 0))
-                
                 pool_fee = float(getattr(fees_obj, "fee_percentage", 0))
+
+            # Extract Execution Time
+            exec_ms = getattr(quote, "estimated_execution_time_ms", None)
+            if exec_ms is not None:
+                exec_time = float(exec_ms) / 1000.0
 
         except Exception as parse_err:
             print(f"[QUOTE PARSE ERROR] {parse_err}")
@@ -317,6 +338,7 @@ async def get_quote(sell: str, buy: str, amount: str):
             "expected_output": output,
             "network_fee_cc": network_fee,
             "pool_fee_percent": pool_fee,
+            "execution_time_seconds": exec_time,
             "status": "success"
         }
     except Exception as e:

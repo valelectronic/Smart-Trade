@@ -34,7 +34,9 @@ export function OrderForm({ onOrderCreated }: { onOrderCreated: () => void }) {
   const [amount, setAmount] = useState("");
   const [errorMsg, setErrorMsg] = useState("");
   const [isMounted, setIsMounted] = useState(false);
-    const amountNum = parseFloat(amount) || 0;
+
+  const amountNum = parseFloat(amount) || 0;
+
   // Load from localStorage safely on mount
   useEffect(() => {
     const savedSell = localStorage.getItem("cantex_sellToken");
@@ -102,7 +104,7 @@ export function OrderForm({ onOrderCreated }: { onOrderCreated: () => void }) {
     }
   }, [sellToken, buyToken]);
 
-    // Fetch pool info and quote when tokens or amount change
+  // Fetch pool info and quote when tokens or amount change
   useEffect(() => {
     if (sellToken && buyToken && sellToken !== buyToken) {
       setIsFetchingPool(true);
@@ -117,30 +119,31 @@ export function OrderForm({ onOrderCreated }: { onOrderCreated: () => void }) {
         .finally(() => setIsFetchingPool(false));
 
       // 2. Fetch Quote OR Calculate Fallback
-      if (parseFloat(amount) > 0) {
+      if (amountNum > 0) {
         fetch(`${process.env.NEXT_PUBLIC_API_URL}/quote?sell=${sellToken}&buy=${buyToken}&amount=${amount}`)
           .then(res => res.json())
           .then(data => {
             if (data.status === "success" && data.expected_output > 0) {
               setQuoteData(data);
             } else {
-              // FALLBACK: Calculate expected output locally if the backend fails
+              // FALLBACK
               const expectedOutput = amountNum / (livePrice || 1);
               setQuoteData({
                 expected_output: expectedOutput,
-                network_fee_cc: 0.6, // Standard Cantex network fee
+                network_fee_cc: 0.6,
                 pool_fee_percent: 0.15,
+                execution_time_seconds: 10,
                 status: "fallback"
               });
             }
           })
           .catch(() => {
-            // FALLBACK if network request fails
             const expectedOutput = amountNum / (livePrice || 1);
             setQuoteData({
               expected_output: expectedOutput,
               network_fee_cc: 0.6,
               pool_fee_percent: 0.15,
+              execution_time_seconds: 10,
               status: "fallback"
             });
           });
@@ -289,6 +292,7 @@ export function OrderForm({ onOrderCreated }: { onOrderCreated: () => void }) {
       )}
     </div>
   );
+
   const tradeValueUsd = sellLivePrice > 0 ? amountNum * sellLivePrice : 0;
 
   return (
@@ -405,7 +409,10 @@ export function OrderForm({ onOrderCreated }: { onOrderCreated: () => void }) {
               <ShieldCheck size={12} /> Pool Size
             </span>
             <span className="text-[11px] text-snow font-mono">
-              {isFetchingPool ? "..." : `${parseFloat(poolInfo.pool_size_cc).toLocaleString(undefined, { maximumFractionDigits: 0 })} CC`}
+              {isFetchingPool ? "..." : 
+                (parseFloat(poolInfo.pool_size_cc) > 0 
+                  ? `${parseFloat(poolInfo.pool_size_cc).toLocaleString(undefined, { maximumFractionDigits: 0 })} CC`
+                  : poolInfo.pool_size_cc)}
             </span>
           </div>
           
@@ -427,7 +434,11 @@ export function OrderForm({ onOrderCreated }: { onOrderCreated: () => void }) {
             <span className="text-[11px] text-granite flex items-center gap-1">
               <Clock size={12} /> Est. Time
             </span>
-            <span className="text-[11px] text-snow font-mono">~10-25s</span>
+            <span className="text-[11px] text-snow font-mono">
+              {quoteData && quoteData.execution_time_seconds > 0 
+                ? `~${quoteData.execution_time_seconds.toFixed(1)}s` 
+                : "~10-25s"}
+            </span>
           </div>
         </div>
 
