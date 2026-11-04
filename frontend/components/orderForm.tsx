@@ -17,8 +17,9 @@ export function OrderForm({ onOrderCreated }: { onOrderCreated: () => void }) {
   const [livePrice, setLivePrice] = useState<number>(0);      
   const [sellLivePrice, setSellLivePrice] = useState<number>(0); 
   
-  // Pool Info
+  // Pool Info & Quote
   const [poolInfo, setPoolInfo] = useState<{ pool_size_cc: string; fee_percent: string }>({ pool_size_cc: "0", fee_percent: "0" });
+  const [quoteData, setQuoteData] = useState<any>(null);
   const [isFetchingPool, setIsFetchingPool] = useState(false);
 
   const [isSellOpen, setIsSellOpen] = useState(false);
@@ -101,10 +102,12 @@ export function OrderForm({ onOrderCreated }: { onOrderCreated: () => void }) {
     }
   }, [sellToken, buyToken]);
 
-  // Fetch pool info when tokens change
+  // Fetch pool info and quote when tokens or amount change
   useEffect(() => {
     if (sellToken && buyToken && sellToken !== buyToken) {
       setIsFetchingPool(true);
+      
+      // 1. Fetch Pool Info
       fetch(`${process.env.NEXT_PUBLIC_API_URL}/pool-info?sell=${sellToken}&buy=${buyToken}&action=${action}`)
         .then(res => res.json())
         .then(data => {
@@ -112,8 +115,24 @@ export function OrderForm({ onOrderCreated }: { onOrderCreated: () => void }) {
         })
         .catch(() => setPoolInfo({ pool_size_cc: "0", fee_percent: "0" }))
         .finally(() => setIsFetchingPool(false));
+
+      // 2. Fetch Quote (only if amount is valid)
+      if (parseFloat(amount) > 0) {
+        fetch(`${process.env.NEXT_PUBLIC_API_URL}/quote?sell=${sellToken}&buy=${buyToken}&amount=${amount}`)
+          .then(res => res.json())
+          .then(data => {
+            if (data.status === "success") {
+              setQuoteData(data);
+            } else {
+              setQuoteData(null);
+            }
+          })
+          .catch(() => setQuoteData(null));
+      } else {
+        setQuoteData(null);
+      }
     }
-  }, [sellToken, buyToken, action]);
+  }, [sellToken, buyToken, amount, action]);
 
   useEffect(() => {
     function handleClickOutside(event: MouseEvent) {
@@ -257,7 +276,6 @@ export function OrderForm({ onOrderCreated }: { onOrderCreated: () => void }) {
 
   const amountNum = parseFloat(amount) || 0;
   const tradeValueUsd = sellLivePrice > 0 ? amountNum * sellLivePrice : 0;
-  const buyValueUsd = livePrice > 0 ? amountNum * livePrice : 0;
 
   return (
     <Card className="bg-onyx border-shadow-grey relative z-10 w-full max-w-lg mx-auto">
@@ -270,7 +288,7 @@ export function OrderForm({ onOrderCreated }: { onOrderCreated: () => void }) {
       
       <form onSubmit={handleSubmit} className="space-y-4 mt-4">
         
-        {/* SWAP BOX (Cantex Style) */}
+        {/* SWAP BOX */}
         <div className="bg-carbon rounded-2xl p-3 border border-jet-black relative">
           
           {/* YOU PAY */}
@@ -323,7 +341,7 @@ export function OrderForm({ onOrderCreated }: { onOrderCreated: () => void }) {
               </div>
               <div className="w-1/2 relative">
                  <div className="w-full bg-onyx border border-jet-black rounded-xl p-3 text-snow font-mono text-right text-lg text-granite">
-                   ~ {amount ? (amountNum / (livePrice || 1)).toFixed(4) : "0.00"}
+                   {quoteData ? `~ ${quoteData.expected_output.toFixed(4)}` : "0.00"}
                  </div>
                  <div className="text-[10px] text-emerald text-right mt-1 pr-1">
                   {livePrice > 0 ? `Target: $${livePrice.toFixed(5)}` : "Price Unavailable"}
@@ -366,7 +384,7 @@ export function OrderForm({ onOrderCreated }: { onOrderCreated: () => void }) {
           />
         </div>
 
-        {/* TRADE DETAILS (Cantex Style) */}
+        {/* TRADE DETAILS */}
         <div className="bg-carbon/50 rounded-xl p-3 border border-jet-black space-y-1.5 mt-2">
           <div className="flex justify-between items-center">
             <span className="text-[11px] text-granite flex items-center gap-1">
@@ -378,8 +396,17 @@ export function OrderForm({ onOrderCreated }: { onOrderCreated: () => void }) {
           </div>
           
           <div className="flex justify-between items-center">
+            <span className="text-[11px] text-granite">Network Fee</span>
+            <span className="text-[11px] text-snow font-mono">
+              {quoteData ? `${quoteData.network_fee_cc.toFixed(4)} CC` : "0.00 CC"}
+            </span>
+          </div>
+
+          <div className="flex justify-between items-center">
             <span className="text-[11px] text-granite">Pool Fee</span>
-            <span className="text-[11px] text-snow font-mono">{poolInfo.fee_percent}%</span>
+            <span className="text-[11px] text-snow font-mono">
+              {quoteData ? `${quoteData.pool_fee_percent}%` : `${poolInfo.fee_percent}%`}
+            </span>
           </div>
 
           <div className="flex justify-between items-center">

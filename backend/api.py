@@ -177,6 +177,7 @@ def get_price(sell: str, buy: str):
         s = sell.upper()
         b = buy.upper()
         
+        # 1. Determine the target market
         if b in {"USD", "USDC"}:
             market = f"{s}-{b}"
         elif s in {"USD", "USDC"}:
@@ -195,9 +196,25 @@ def get_price(sell: str, buy: str):
         with prices_file.open("r") as f:
             prices = json.load(f)
             
+        # 2. Exact match found
         if market in prices:
             return {"market": market, "price": prices[market]}
         
+        # 3. Fallback: If asking for USD but only CC pair exists, convert it
+        if b in {"USD", "USDC"}:
+            cc_market = f"{s}-CC"
+            if cc_market in prices:
+                cc_rate_key = "CC-USDC"
+                if cc_rate_key in prices:
+                    try:
+                        cc_rate = Decimal(prices[cc_rate_key])
+                        token_in_cc = Decimal(prices[cc_market])
+                        usd_price = token_in_cc * cc_rate
+                        return {"market": cc_market, "price": str(usd_price), "converted_from_cc": True}
+                    except Exception:
+                        pass
+        
+        # 4. Fallback: Try reversed direction
         if s != "CC" and b == "CC":
             reversed_market = f"CC-{s}"
             if reversed_market in prices:
@@ -220,27 +237,15 @@ def get_pool_info(sell: str, buy: str, action: str = "BUY"):
         s = sell.upper()
         b = buy.upper()
         
-        # Determine which market the engine will monitor
-        if action.upper() == "BUY":
-            monitor_token = b
-        else:
-            monitor_token = s
+        monitor_token = b if action.upper() == "BUY" else s
+        market = f"{monitor_token}-CC"
 
-        # Determine the market to check (e.g., TOKEN-CC)
-        if monitor_token == "CC":
-            market = f"{b}-CC" if s == "CC" else f"{s}-CC"
-        else:
-            market = f"{monitor_token}-CC"
-
-        # 1. Fetch the live pool state from Cantex
         response = requests.get(f"{PUBLIC_BASE}/pools/state", timeout=10)
         response.raise_for_status()
         pools = response.json().get("data", {}).get("pools", [])
         
-        # 2. Find the specific pool
         for pool in pools:
             if pool.get("symbol") == market:
-                # Cantex returns the pool size in CC
                 pool_size = pool.get("reserves", {}).get("CC", "0")
                 return {
                     "market": market,
@@ -251,6 +256,53 @@ def get_pool_info(sell: str, buy: str, action: str = "BUY"):
         return {"error": f"Pool {market} not found", "pool_size_cc": "0", "fee_percent": "0"}
     except Exception as e:
         return {"error": str(e), "pool_size_cc": "0", "fee_percent": "0"}
+
+
+@app.get("/api/quote")
+async def get_quote(sell: str, buy: str, amount: str):
+    try:
+        s = sell.upper()
+        b = buy.upper()
+        sell_amount = Decimal(amount)
+        
+        client = await connect_sdk()
+        account_admin = await client.get_account_admin()
+        
+        instruments = {}
+        for item in getattr(account_admin, "instruments", []) or []:
+            symbol = getattr(item, "instrument_symbol", None)
+            instrument = getattr(item, "instrument", None)
+            if symbol and instrument is not None:
+                instruments[str(symbol).upper()] = instrument
+                
+        if s not in instruments or b not in instruments:
+            return {"error": "Missing SDK instrument"}
+            
+        quote = await client.get_swap_quote(
+            sell_amount=sell_amount,
+            sell_instrument=instruments[s],
+            buy_instrument=instruments[b],
+        )
+        
+        close = getattr(client, "close", None)
+        if close:
+            result = close()
+            if asyncio.iscoroutine(result):
+                await result
+                
+        # Extract data from quote
+        output = float(quote.get("returned", {}).get("amount", 0))
+        network_fee = float(quote.get("fees", {}).get("network_fee", {}).get("amount", 0))
+        pool_fee = float(quote.get("fees", {}).get("fee_percentage", 0))
+        
+        return {
+            "expected_output": output,
+            "network_fee_cc": network_fee,
+            "pool_fee_percent": pool_fee,
+            "status": "success"
+        }
+    except Exception as e:
+        return {"error": str(e), "status": "failed"}
 
 
 @app.post("/api/subscribe")
