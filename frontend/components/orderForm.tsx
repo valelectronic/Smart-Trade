@@ -104,54 +104,19 @@ export function OrderForm({ onOrderCreated }: { onOrderCreated: () => void }) {
     }
   }, [sellToken, buyToken]);
 
-  // Fetch pool info and quote when tokens or amount change
+  // Fetch pool info only (no quote fetch to avoid infinite loops)
   useEffect(() => {
     if (sellToken && buyToken && sellToken !== buyToken) {
       setIsFetchingPool(true);
-      
-      // 1. Fetch Pool Info
       fetch(`${process.env.NEXT_PUBLIC_API_URL}/pool-info?sell=${sellToken}&buy=${buyToken}&action=${action}`)
         .then(res => res.json())
         .then(data => {
-          setPoolInfo({ pool_size_cc: data.pool_size_cc || "0", fee_percent: data.fee_percent || "0" });
+          setPoolInfo({ pool_size_cc: data.pool_size_cc || "0", fee_percent: data.fee_percent || "0.15" });
         })
-        .catch(() => setPoolInfo({ pool_size_cc: "0", fee_percent: "0" }))
+        .catch(() => setPoolInfo({ pool_size_cc: "0", fee_percent: "0.15" }))
         .finally(() => setIsFetchingPool(false));
-
-      // 2. Fetch Quote OR Calculate Fallback
-      if (amountNum > 0) {
-        fetch(`${process.env.NEXT_PUBLIC_API_URL}/quote?sell=${sellToken}&buy=${buyToken}&amount=${amount}`)
-          .then(res => res.json())
-          .then(data => {
-            if (data.status === "success" && data.expected_output > 0) {
-              setQuoteData(data);
-            } else {
-              // FALLBACK
-              const expectedOutput = amountNum / (livePrice || 1);
-              setQuoteData({
-                expected_output: expectedOutput,
-                network_fee_cc: 0.6,
-                pool_fee_percent: 0.15,
-                execution_time_seconds: 10,
-                status: "fallback"
-              });
-            }
-          })
-          .catch(() => {
-            const expectedOutput = amountNum / (livePrice || 1);
-            setQuoteData({
-              expected_output: expectedOutput,
-              network_fee_cc: 0.6,
-              pool_fee_percent: 0.15,
-              execution_time_seconds: 10,
-              status: "fallback"
-            });
-          });
-      } else {
-        setQuoteData(null);
-      }
     }
-  }, [sellToken, buyToken, amount, action, livePrice, amountNum]);
+  }, [sellToken, buyToken, action]);
 
   useEffect(() => {
     function handleClickOutside(event: MouseEvent) {
@@ -293,7 +258,20 @@ export function OrderForm({ onOrderCreated }: { onOrderCreated: () => void }) {
     </div>
   );
 
+  // --- LOCAL CALCULATIONS ---
   const tradeValueUsd = sellLivePrice > 0 ? amountNum * sellLivePrice : 0;
+  
+  // Expected Output: (Amount * Sell Price) / Buy Price
+  const expectedOutput = livePrice > 0 && sellLivePrice > 0 
+    ? (amountNum * sellLivePrice) / livePrice 
+    : 0;
+
+  // Determine displayed fee (fix 0.0015 to 0.15)
+  const displayPoolFee = poolInfo.fee_percent 
+    ? (parseFloat(poolInfo.fee_percent) < 0.1 
+        ? (parseFloat(poolInfo.fee_percent) * 100).toFixed(2) 
+        : parseFloat(poolInfo.fee_percent).toFixed(2)) 
+    : "0.15";
 
   return (
     <Card className="bg-onyx border-shadow-grey relative z-10 w-full max-w-lg mx-auto">
@@ -359,7 +337,7 @@ export function OrderForm({ onOrderCreated }: { onOrderCreated: () => void }) {
               </div>
               <div className="w-1/2 relative">
                  <div className="w-full bg-onyx border border-jet-black rounded-xl p-3 text-snow font-mono text-right text-lg text-granite">
-                   {quoteData ? `~ ${quoteData.expected_output.toFixed(4)}` : "0.00"}
+                   ~ {expectedOutput.toFixed(4)}
                  </div>
                  <div className="text-[10px] text-emerald text-right mt-1 pr-1">
                   {livePrice > 0 ? `Target: $${livePrice.toFixed(5)}` : "Price Unavailable"}
@@ -412,22 +390,18 @@ export function OrderForm({ onOrderCreated }: { onOrderCreated: () => void }) {
               {isFetchingPool ? "..." : 
                 (parseFloat(poolInfo.pool_size_cc) > 0 
                   ? `${parseFloat(poolInfo.pool_size_cc).toLocaleString(undefined, { maximumFractionDigits: 0 })} CC`
-                  : poolInfo.pool_size_cc)}
+                  : "Unavailable")}
             </span>
           </div>
           
           <div className="flex justify-between items-center">
             <span className="text-[11px] text-granite">Network Fee</span>
-            <span className="text-[11px] text-snow font-mono">
-              {quoteData ? `${quoteData.network_fee_cc.toFixed(4)} CC` : "0.00 CC"}
-            </span>
+            <span className="text-[11px] text-snow font-mono">0.6000 CC</span>
           </div>
 
           <div className="flex justify-between items-center">
             <span className="text-[11px] text-granite">Pool Fee</span>
-            <span className="text-[11px] text-snow font-mono">
-              {quoteData ? `${quoteData.pool_fee_percent}%` : `${poolInfo.fee_percent}%`}
-            </span>
+            <span className="text-[11px] text-snow font-mono">{displayPoolFee}%</span>
           </div>
 
           <div className="flex justify-between items-center">
@@ -437,7 +411,7 @@ export function OrderForm({ onOrderCreated }: { onOrderCreated: () => void }) {
             <span className="text-[11px] text-snow font-mono">
               {quoteData && quoteData.execution_time_seconds > 0 
                 ? `~${quoteData.execution_time_seconds.toFixed(1)}s` 
-                : "~10-25s"}
+                : "~10s"}
             </span>
           </div>
         </div>
