@@ -282,11 +282,12 @@ async def get_quote(sell: str, buy: str, amount: str):
             if asyncio.iscoroutine(result):
                 await result
                 
-        # --- FIXED: Use attribute access, not .get() ---
+        # Extract all data from the quote object
         output = 0.0
         network_fee = 0.0
         pool_fee = 0.0
         exec_time = 0.0
+        pool_size = "0"
 
         try:
             returned_obj = getattr(quote, "returned", None)
@@ -298,12 +299,29 @@ async def get_quote(sell: str, buy: str, amount: str):
                 net_fee_obj = getattr(fees_obj, "network_fee", None)
                 if net_fee_obj is not None:
                     network_fee = float(getattr(net_fee_obj, "amount", 0))
-                
                 pool_fee = float(getattr(fees_obj, "fee_percentage", 0))
 
-            exec_ms = getattr(quote, "estimated_execution_time_ms", None)
-            if exec_ms is not None:
-                exec_time = float(exec_ms) / 1000.0
+            exec_sec = getattr(quote, "estimated_time_seconds", None)
+            if exec_sec is not None:
+                exec_time = float(exec_sec)
+
+            # --- THE FIX: Parse the pools array for the CC reserve ---
+            pools_list = getattr(quote, "pools", None)
+            if pools_list:
+                for pool in pools_list:
+                    # Check if this pool involves CC
+                    reserve_a = getattr(pool, "reserve_a", None)
+                    reserve_b = getattr(pool, "reserve_b", None)
+                    token_a = getattr(pool, "token_a_instrument", None)
+                    token_b = getattr(pool, "token_b_instrument", None)
+                    
+                    # If one of the tokens is CC, use its reserve as the pool size
+                    if token_a and str(token_a).upper() == "CC":
+                        pool_size = str(reserve_a)
+                        break
+                    elif token_b and str(token_b).upper() == "CC":
+                        pool_size = str(reserve_b)
+                        break
 
         except Exception as parse_err:
             print(f"[QUOTE PARSE ERROR] {parse_err}")
@@ -313,6 +331,80 @@ async def get_quote(sell: str, buy: str, amount: str):
             "network_fee_cc": network_fee,
             "pool_fee_percent": pool_fee,
             "execution_time_seconds": exec_time,
+            "pool_size_cc": pool_size,
+            "status": "success"
+        }
+    except Exception as e:
+        return {"error": str(e), "status": "failed"}
+    
+
+@app.get("/api/portfolio-value")
+async def get_portfolio_value():
+    try:
+        # 1. Get all balances
+        client = await connect_sdk()
+        account = await client.get_account_info()
+        balances = {}
+        for item in getattr(account, "tokens", []) or []:
+            symbol = getattr(item, "instrument_symbol", None)
+            unlocked = getattr(item, "unlocked_amount", None)
+            if symbol and unlocked is not None:
+                balances[symbol.upper()] = Decimal(str(unlocked))
+        
+        close = getattr(client, "close", None)
+        if close:
+            result = close()
+            if asyncio.iscoroutine(result):
+                await result
+
+        # 2. Get live prices from Cantex
+        response = requests.get(f"{PUBLIC_BASE}/markets/info", timeout=5)
+        response.raise_for_status()
+        markets = response.json().get("data", {}).get("markets", [])
+        
+        # Create a map of symbol -> price
+        price_map = {}
+        for m in markets:
+            symbol = m.get("symbol")
+            price = m.get("price")
+            if symbol and price:
+                price_map[symbol] = Decimal(price)
+
+        # 3. Calculate total value
+        total_usd = Decimal("0")
+        breakdown = {}
+
+        for token, amount in balances.items():
+            if amount <= 0:
+                continue
+
+            usd_price = Decimal("0")
+
+            # Try direct USD market (e.g., CC-USDC)
+            if f"{token}-USDC" in price_map:
+                usd_price = price_map[f"{token}-USDC"]
+            # Try CC market and convert to USD
+            elif f"{token}-CC" in price_map and "CC-USDC" in price_map:
+                token_in_cc = price_map[f"{token}-CC"]
+                cc_usd = price_map["CC-USDC"]
+                usd_price = token_in_cc * cc_usd
+            # Fallback to prices.json if available
+            else:
+                prices_file = Path(__file__).parent / "prices.json"
+                if prices_file.exists():
+                    with prices_file.open("r") as f:
+                        prices = json.load(f)
+                    if f"{token}-CC" in prices and "CC-USDC" in prices:
+                        usd_price = Decimal(prices[f"{token}-CC"]) * Decimal(prices["CC-USDC"])
+
+            if usd_price > 0:
+                value = amount * usd_price
+                total_usd += value
+                breakdown[token] = str(value)
+
+        return {
+            "total_usd": str(total_usd),
+            "breakdown": breakdown,
             "status": "success"
         }
     except Exception as e:

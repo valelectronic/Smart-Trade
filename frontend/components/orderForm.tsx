@@ -5,7 +5,7 @@ import { toast } from "sonner";
 import { createOrder, getMarkets, getBalances, getLivePrice } from "@/lib/api";
 import { Card } from "./ui/card";
 import { Button } from "./ui/Button";
-import { ChevronDown, ArrowUpDown, AlertCircle, Info, Clock, ShieldCheck } from "lucide-react";
+import { ChevronDown, ArrowUpDown, AlertCircle, Clock, ShieldCheck } from "lucide-react";
 import { PriceTicker } from "./priceTicker";
 
 export function OrderForm({ onOrderCreated }: { onOrderCreated: () => void }) {
@@ -17,10 +17,9 @@ export function OrderForm({ onOrderCreated }: { onOrderCreated: () => void }) {
   const [livePrice, setLivePrice] = useState<number>(0);      
   const [sellLivePrice, setSellLivePrice] = useState<number>(0); 
   
-  // Pool Info & Quote
-  const [poolInfo, setPoolInfo] = useState<{ pool_size_cc: string; fee_percent: string }>({ pool_size_cc: "0", fee_percent: "0" });
+  // Quote Data
   const [quoteData, setQuoteData] = useState<any>(null);
-  const [isFetchingPool, setIsFetchingPool] = useState(false);
+  const [isFetchingQuote, setIsFetchingQuote] = useState(false);
 
   const [isSellOpen, setIsSellOpen] = useState(false);
   const [isBuyOpen, setIsBuyOpen] = useState(false);
@@ -104,19 +103,25 @@ export function OrderForm({ onOrderCreated }: { onOrderCreated: () => void }) {
     }
   }, [sellToken, buyToken]);
 
-  // Fetch pool info only (no quote fetch to avoid infinite loops)
+  // Fetch quote from backend (this includes pool size, fees, and time)
   useEffect(() => {
-    if (sellToken && buyToken && sellToken !== buyToken) {
-      setIsFetchingPool(true);
-      fetch(`${process.env.NEXT_PUBLIC_API_URL}/pool-info?sell=${sellToken}&buy=${buyToken}&action=${action}`)
+    if (sellToken && buyToken && sellToken !== buyToken && amountNum > 0) {
+      setIsFetchingQuote(true);
+      fetch(`${process.env.NEXT_PUBLIC_API_URL}/quote?sell=${sellToken}&buy=${buyToken}&amount=${amount}`)
         .then(res => res.json())
         .then(data => {
-          setPoolInfo({ pool_size_cc: data.pool_size_cc || "0", fee_percent: data.fee_percent || "0.15" });
+          if (data.status === "success" && data.expected_output > 0) {
+            setQuoteData(data);
+          } else {
+            setQuoteData(null);
+          }
         })
-        .catch(() => setPoolInfo({ pool_size_cc: "0", fee_percent: "0.15" }))
-        .finally(() => setIsFetchingPool(false));
+        .catch(() => setQuoteData(null))
+        .finally(() => setIsFetchingQuote(false));
+    } else {
+      setQuoteData(null);
     }
-  }, [sellToken, buyToken, action]);
+  }, [sellToken, buyToken, amount, action, amountNum]);
 
   useEffect(() => {
     function handleClickOutside(event: MouseEvent) {
@@ -200,6 +205,7 @@ export function OrderForm({ onOrderCreated }: { onOrderCreated: () => void }) {
       setTriggerPrice("");
       setAmount("");
       setErrorMsg("");
+      setQuoteData(null);
       
       localStorage.removeItem("cantex_sellToken");
       localStorage.removeItem("cantex_buyToken");
@@ -258,20 +264,22 @@ export function OrderForm({ onOrderCreated }: { onOrderCreated: () => void }) {
     </div>
   );
 
-  // --- LOCAL CALCULATIONS ---
+  // Local fallback calculation
   const tradeValueUsd = sellLivePrice > 0 ? amountNum * sellLivePrice : 0;
-  
-  // Expected Output: (Amount * Sell Price) / Buy Price
-  const expectedOutput = livePrice > 0 && sellLivePrice > 0 
+  const localExpectedOutput = livePrice > 0 && sellLivePrice > 0 
     ? (amountNum * sellLivePrice) / livePrice 
     : 0;
 
-  // Determine displayed fee (fix 0.0015 to 0.15)
-  const displayPoolFee = poolInfo.fee_percent 
-    ? (parseFloat(poolInfo.fee_percent) < 0.1 
-        ? (parseFloat(poolInfo.fee_percent) * 100).toFixed(2) 
-        : parseFloat(poolInfo.fee_percent).toFixed(2)) 
-    : "0.15";
+  // Use quote data if available, otherwise fallback
+  const displayOutput = quoteData ? quoteData.expected_output : localExpectedOutput;
+  const displayPoolSize = quoteData 
+    ? (parseFloat(quoteData.pool_size_cc) > 0 ? `${parseFloat(quoteData.pool_size_cc).toLocaleString(undefined, { maximumFractionDigits: 0 })} CC` : "Unavailable")
+    : "Unavailable";
+  const displayNetworkFee = quoteData ? `${quoteData.network_fee_cc.toFixed(4)} CC` : "---";
+  const displayPoolFee = quoteData ? `${(quoteData.pool_fee_percent * 100).toFixed(4)}%` : "---";
+  const displayExecTime = quoteData && quoteData.execution_time_seconds > 0 
+    ? `~${quoteData.execution_time_seconds.toFixed(1)}s` 
+    : "---";
 
   return (
     <Card className="bg-onyx border-shadow-grey relative z-10 w-full max-w-lg mx-auto">
@@ -337,7 +345,7 @@ export function OrderForm({ onOrderCreated }: { onOrderCreated: () => void }) {
               </div>
               <div className="w-1/2 relative">
                  <div className="w-full bg-onyx border border-jet-black rounded-xl p-3 text-snow font-mono text-right text-lg text-granite">
-                   ~ {expectedOutput.toFixed(4)}
+                   {isFetchingQuote ? "..." : `~ ${displayOutput.toFixed(4)}`}
                  </div>
                  <div className="text-[10px] text-emerald text-right mt-1 pr-1">
                   {livePrice > 0 ? `Target: $${livePrice.toFixed(5)}` : "Price Unavailable"}
@@ -387,21 +395,22 @@ export function OrderForm({ onOrderCreated }: { onOrderCreated: () => void }) {
               <ShieldCheck size={12} /> Pool Size
             </span>
             <span className="text-[11px] text-snow font-mono">
-              {isFetchingPool ? "..." : 
-                (parseFloat(poolInfo.pool_size_cc) > 0 
-                  ? `${parseFloat(poolInfo.pool_size_cc).toLocaleString(undefined, { maximumFractionDigits: 0 })} CC`
-                  : "Unavailable")}
+              {isFetchingQuote ? "..." : displayPoolSize}
             </span>
           </div>
           
           <div className="flex justify-between items-center">
             <span className="text-[11px] text-granite">Network Fee</span>
-            <span className="text-[11px] text-snow font-mono">0.6000 CC</span>
+            <span className="text-[11px] text-snow font-mono">
+              {isFetchingQuote ? "..." : displayNetworkFee}
+            </span>
           </div>
 
           <div className="flex justify-between items-center">
             <span className="text-[11px] text-granite">Pool Fee</span>
-            <span className="text-[11px] text-snow font-mono">{displayPoolFee}%</span>
+            <span className="text-[11px] text-snow font-mono">
+              {isFetchingQuote ? "..." : displayPoolFee}
+            </span>
           </div>
 
           <div className="flex justify-between items-center">
@@ -409,9 +418,7 @@ export function OrderForm({ onOrderCreated }: { onOrderCreated: () => void }) {
               <Clock size={12} /> Est. Time
             </span>
             <span className="text-[11px] text-snow font-mono">
-              {quoteData && quoteData.execution_time_seconds > 0 
-                ? `~${quoteData.execution_time_seconds.toFixed(1)}s` 
-                : "~10s"}
+              {isFetchingQuote ? "..." : displayExecTime}
             </span>
           </div>
         </div>
