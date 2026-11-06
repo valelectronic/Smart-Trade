@@ -362,7 +362,7 @@ async def get_portfolio_value():
         response.raise_for_status()
         markets = response.json().get("data", {}).get("markets", [])
         
-        # Normalize all keys to uppercase
+        # NORMALIZE ALL KEYS TO UPPERCASE
         price_map = {}
         for m in markets:
             symbol = m.get("symbol")
@@ -389,15 +389,15 @@ async def get_portfolio_value():
             usd_price = Decimal("0")
             token_upper = token.upper()
 
-            # 1. Try direct USD or USDC pair
+            # 1. Try direct USD/USDC pairs
             if f"{token_upper}-USDC" in price_map:
                 usd_price = price_map[f"{token_upper}-USDC"]
             elif f"{token_upper}-USD" in price_map:
                 usd_price = price_map[f"{token_upper}-USD"]
-            # 2. Try CC market and convert to USD
+            # 2. Try CC market and convert
             elif f"{token_upper}-CC" in price_map and "CC-USDC" in price_map:
                 usd_price = price_map[f"{token_upper}-CC"] * price_map["CC-USDC"]
-            # 3. If token is CC, just use the CC-USDC rate
+            # 3. CC token special case
             elif token_upper == "CC" and "CC-USDC" in price_map:
                 usd_price = price_map["CC-USDC"]
             # 4. Fallback to prices.json
