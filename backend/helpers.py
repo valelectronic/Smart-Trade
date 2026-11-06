@@ -47,13 +47,14 @@ def attr(obj, path, default=None):
 # ============================================================
 
 def get_token_balance(account_info, symbol):
-    """Return a token's unlocked balance from account_info.tokens."""
+    """Return a token's unlocked balance from account_info.tokens (case-insensitive)."""
     tokens = getattr(account_info, "tokens", None) or []
+    symbol_upper = symbol.upper()
 
     for item in tokens:
-        if getattr(item, "instrument_symbol", None) == symbol:
+        item_symbol = getattr(item, "instrument_symbol", None)
+        if item_symbol and item_symbol.upper() == symbol_upper:
             balance = getattr(item, "unlocked_amount", None)
-
             if balance is not None:
                 return dec(balance)
 
