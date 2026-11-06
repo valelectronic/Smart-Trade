@@ -97,8 +97,16 @@ export function OrderForm({ onOrderCreated }: { onOrderCreated: () => void }) {
     }
   }, [sellToken, buyToken]);
 
-  useEffect(() => {
-    if (sellToken && buyToken && sellToken !== buyToken && amountNum > 0) {
+
+
+    useEffect(() => {
+    if (!sellToken || !buyToken || sellToken === buyToken || amountNum <= 0) {
+      setQuoteData(null);
+      return;
+    }
+
+    // DEBOUNCE: Wait 1 second after the user stops typing
+    const timeoutId = setTimeout(() => {
       setIsFetchingQuote(true);
       fetch(`${process.env.NEXT_PUBLIC_API_URL}/quote?sell=${sellToken}&buy=${buyToken}&amount=${amount}`)
         .then(res => res.json())
@@ -111,10 +119,12 @@ export function OrderForm({ onOrderCreated }: { onOrderCreated: () => void }) {
         })
         .catch(() => setQuoteData(null))
         .finally(() => setIsFetchingQuote(false));
-    } else {
-      setQuoteData(null);
-    }
+    }, 1000); // 1000ms = 1 second
+
+    return () => clearTimeout(timeoutId);
   }, [sellToken, buyToken, amount, action, amountNum]);
+
+
 
   useEffect(() => {
     function handleClickOutside(event: MouseEvent) {
