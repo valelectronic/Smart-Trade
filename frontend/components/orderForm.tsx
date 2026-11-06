@@ -99,8 +99,15 @@ export function OrderForm({ onOrderCreated }: { onOrderCreated: () => void }) {
 
 
 
-    useEffect(() => {
-    if (!sellToken || !buyToken || sellToken === buyToken || amountNum <= 0) {
+      // Fetch quote from backend
+  useEffect(() => {
+    if (!sellToken || !buyToken || sellToken === buyToken) {
+      setQuoteData(null);
+      return;
+    }
+
+    // If the amount is empty, clear the quote immediately
+    if (amountNum <= 0) {
       setQuoteData(null);
       return;
     }
@@ -119,11 +126,10 @@ export function OrderForm({ onOrderCreated }: { onOrderCreated: () => void }) {
         })
         .catch(() => setQuoteData(null))
         .finally(() => setIsFetchingQuote(false));
-    }, 1000); // 1000ms = 1 second
+    }, 1000);
 
     return () => clearTimeout(timeoutId);
-  }, [sellToken, buyToken, amount, action, amountNum]);
-
+  }, [sellToken, buyToken, amount, action]);
 
 
   useEffect(() => {
