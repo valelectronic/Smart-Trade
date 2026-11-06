@@ -4,7 +4,7 @@ import { useState, useEffect } from "react";
 import { OrderForm } from "@/components/orderForm";
 import { OrderTable } from "@/components/orderTable";
 import { MarketBar } from "@/components/marketBar"; 
-import { getBalances, getLivePrice } from "@/lib/api"; // <-- Import these
+import { getBalances, getLivePrice } from "@/lib/api";
 import { Wallet, Activity, Bell, PlusCircle, List, TrendingUp } from "lucide-react";
 
 export default function Home() {
@@ -32,7 +32,7 @@ export default function Home() {
     }
   }, [activeTab, isMounted]);
 
-     // Fetch Total Portfolio Value (Optimized)
+  // Fetch Total Portfolio Value
   useEffect(() => {
     let isCancelled = false;
 
@@ -41,15 +41,19 @@ export default function Home() {
       
       const timeoutId = setTimeout(() => {
         if (!isCancelled) setIsFetchingValue(false);
-      }, 6000);
+      }, 8000); // Increased timeout for slow SDK calls
 
       try {
-        // Call the new backend endpoint that calculates everything
         const res = await fetch(`${process.env.NEXT_PUBLIC_API_URL}/portfolio-value`);
         const data = await res.json();
         
-        if (data.status === "success" && !isCancelled) {
-          setTotalPortfolioValue(parseFloat(data.total_usd));
+        if (data.status === "success" && data.total_usd && !isCancelled) {
+          const parsedValue = parseFloat(data.total_usd);
+          if (!isNaN(parsedValue)) {
+            setTotalPortfolioValue(parsedValue);
+          }
+        } else {
+          console.error("Portfolio error:", data.error || "Unknown error");
         }
       } catch (err) {
         console.error("Failed to fetch portfolio value", err);
@@ -114,7 +118,7 @@ export default function Home() {
       {/* Main Content */}
       <main className="flex-1 max-w-5xl w-full mx-auto p-4 md:p-8 pb-24 md:pb-8">
         
-        {/* --- NEW: TOTAL PORTFOLIO VALUE CARD --- */}
+        {/* --- TOTAL PORTFOLIO VALUE CARD --- */}
         <div className="bg-carbon border border-jet-black rounded-2xl p-5 mb-6 flex items-center justify-between">
           <div>
             <p className="text-xs text-granite mb-1 uppercase tracking-wider font-semibold">Estimated Total Value</p>

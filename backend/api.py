@@ -18,7 +18,6 @@ from pydantic import BaseModel, ConfigDict, Field
 from cantex_api import connect_sdk
 from helpers import get_token_balance
 
-# --- CHANGED: Points to new Postgres file ---
 from postgres_database import add_order, delete_order, get_all_orders, init_db
 from config import PUBLIC_BASE
 
@@ -106,7 +105,7 @@ class OrderCreate(BaseModel):
         route_token = None
         market = ""
 
-        # Determine which token we are monitoring based on the action
+        # --- THE FIX: Robust routing that never throws a 422 ---
         if self.action == "BUY":
             monitor_token = buy_token
         else:
@@ -117,17 +116,19 @@ class OrderCreate(BaseModel):
             market = f"{sell_token}-{buy_token}"
         elif f"{buy_token}-{sell_token}" in valid_symbols:
             market = f"{buy_token}-{sell_token}"
-        elif monitor_token == "CC" and f"{sell_token}-CC" in valid_symbols:
-            market = f"{sell_token}-CC"
-        elif monitor_token == "CC" and f"{buy_token}-CC" in valid_symbols:
+        # 2. Try the buy token CC market
+        elif f"{buy_token}-CC" in valid_symbols:
             market = f"{buy_token}-CC"
+            route_token = sell_token
+        # 3. Try the sell token CC market
+        elif f"{sell_token}-CC" in valid_symbols:
+            market = f"{sell_token}-CC"
+            route_token = buy_token
+        # 4. Force the buy token CC market (trust the SDK)
         else:
-            # For two-leg swaps, ALWAYS monitor the token we are trading
-            if f"{monitor_token}-CC" in valid_symbols:
-                market = f"{monitor_token}-CC"
-                route_token = buy_token if self.action == "BUY" else sell_token
-            else:
-                raise ValueError(f"Could not find a valid route for {sell_token} to {buy_token} on Cantex.")
+            market = f"{buy_token}-CC"
+            route_token = sell_token
+        # --- END OF FIX ---
 
         return {
             "id": self.id or uuid.uuid4().hex,
@@ -186,6 +187,7 @@ def get_price(sell: str, buy: str):
             market = f"{s}-CC" if s != "CC" else f"{b}-CC"
             
         prices_file = Path(__file__).parent / "prices.json"
+        prices = {}
         
         if prices_file.exists():
             with prices_file.open("r") as f:
@@ -212,17 +214,28 @@ def get_price(sell: str, buy: str):
             response.raise_for_status()
             markets = response.json().get("data", {}).get("markets", [])
             
+            # First try the direct market (e.g., TF-USDT-USDC)
             for m in markets:
                 if m.get("symbol") == market:
                     return {"market": market, "price": str(m.get("price", "0"))}
+            
+            # If direct market not found, try CC pair and convert
+            if b in {"USD", "USDC"}:
+                cc_market = f"{s}-CC"
+                for m in markets:
+                    if m.get("symbol") == cc_market:
+                        # Safely get the CC rate from prices or default to 0
+                        cc_rate = Decimal(prices.get("CC-USDC", "0")) if prices else Decimal("0")
+                        if cc_rate > 0:
+                            token_in_cc = Decimal(m.get("price", "0"))
+                            usd_price = token_in_cc * cc_rate
+                            return {"market": cc_market, "price": str(usd_price), "converted_from_cc": True}
         except Exception:
             pass
             
         return {"error": f"No live price for {market} yet", "price": "0"}
     except Exception as e:
         return {"error": str(e), "price": "0"}
-
-
 
 @app.get("/api/pool-info")
 def get_pool_info(sell: str, buy: str, action: str = "BUY"):
@@ -283,7 +296,6 @@ async def get_quote(sell: str, buy: str, amount: str):
             if asyncio.iscoroutine(result):
                 await result
                 
-        # Extract all data from the quote object
         output = 0.0
         network_fee = 0.0
         pool_fee = 0.0
@@ -306,17 +318,14 @@ async def get_quote(sell: str, buy: str, amount: str):
             if exec_sec is not None:
                 exec_time = float(exec_sec)
 
-            # --- THE FIX: Parse the pools array for the CC reserve ---
             pools_list = getattr(quote, "pools", None)
             if pools_list:
                 for pool in pools_list:
-                    # Check if this pool involves CC
                     reserve_a = getattr(pool, "reserve_a", None)
                     reserve_b = getattr(pool, "reserve_b", None)
                     token_a = getattr(pool, "token_a_instrument", None)
                     token_b = getattr(pool, "token_b_instrument", None)
                     
-                    # If one of the tokens is CC, use its reserve as the pool size
                     if token_a and str(token_a).upper() == "CC":
                         pool_size = str(reserve_a)
                         break
@@ -337,7 +346,7 @@ async def get_quote(sell: str, buy: str, amount: str):
         }
     except Exception as e:
         return {"error": str(e), "status": "failed"}
-    
+
 
 @app.get("/api/portfolio-value")
 async def get_portfolio_value():
@@ -362,7 +371,6 @@ async def get_portfolio_value():
         response.raise_for_status()
         markets = response.json().get("data", {}).get("markets", [])
         
-        # NORMALIZE ALL KEYS TO UPPERCASE
         price_map = {}
         for m in markets:
             symbol = m.get("symbol")
@@ -389,11 +397,11 @@ async def get_portfolio_value():
             usd_price = Decimal("0")
             token_upper = token.upper()
 
-            # 1. Try direct USD/USDC pairs
+            # 1. Try direct USD/USDC pairs (with USDCX fix)
             if f"{token_upper}-USDC" in price_map:
                 usd_price = price_map[f"{token_upper}-USDC"]
-            elif f"{token_upper}-USD" in price_map:
-                usd_price = price_map[f"{token_upper}-USD"]
+            elif f"{token_upper}-USDCX" in price_map:
+                usd_price = price_map[f"{token_upper}-USDCX"]
             # 2. Try CC market and convert
             elif f"{token_upper}-CC" in price_map and "CC-USDC" in price_map:
                 usd_price = price_map[f"{token_upper}-CC"] * price_map["CC-USDC"]
@@ -420,7 +428,6 @@ async def get_portfolio_value():
 
 @app.post("/api/subscribe")
 async def subscribe_market(market: str):
-    """Tell the monitor to start tracking this market."""
     await subscription_queue.put(market)
     return {"status": "subscribed", "market": market}
 
@@ -451,6 +458,7 @@ async def get_balances():
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to fetch balances: {str(e)}")
 
+
 @app.get("/api/orders")
 def list_orders():
     return get_all_orders()
@@ -468,14 +476,12 @@ def create_order(order: OrderCreate):
 
     try:
         result = add_order(record)
-        # Force the engine to refresh immediately
         try:
             from monitor import subscription_queue
             subscription_queue.put_nowait("refresh")
         except Exception:
             pass
         return result
-    # --- CHANGED: Catch Postgres UniqueViolation ---
     except psycopg2.errors.UniqueViolation as exc:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
@@ -488,7 +494,6 @@ def create_order(order: OrderCreate):
         ) from exc
 
 
-# WebSocket for live prices
 active_connections = []
 
 @app.websocket("/ws/prices")
@@ -549,7 +554,6 @@ def get_history(sell: str, buy: str):
 def remove_order(order_id: str):
     try:
         deleted = delete_order(order_id)
-    # --- CHANGED: Catch Postgres Error ---
     except psycopg2.Error as exc:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
