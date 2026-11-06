@@ -178,64 +178,63 @@ def get_price(sell: str, buy: str):
         s = sell.upper()
         b = buy.upper()
         
-        # 1. Determine the target market
-        if b in {"USD", "USDC"}:
-            market = f"{s}-{b}"
-        elif s in {"USD", "USDC"}:
-            market = f"{b}-{s}"
-        else:
-            market = f"{s}-CC" if s != "CC" else f"{b}-CC"
-            
+        # 1. Load prices.json
         prices_file = Path(__file__).parent / "prices.json"
         prices = {}
-        
         if prices_file.exists():
-            with prices_file.open("r") as f:
-                prices = json.load(f)
+            try:
+                with prices_file.open("r") as f:
+                    prices = json.load(f)
+            except Exception:
+                pass
+
+        # 2. Get the CC-USDC rate (this is the master key)
+        cc_rate = Decimal(prices.get("CC-USDC", "0"))
+        
+        # 3. Determine the market
+        if b in {"USD", "USDC"}:
+            # We want the USD price of the Sell token
+            direct_market = f"{s}-USDC"
+            if direct_market in prices:
+                return {"market": direct_market, "price": prices[direct_market]}
+            
+            # If no direct USDC, use CC price and convert
+            cc_market = f"{s}-CC"
+            if cc_market in prices and cc_rate > 0:
+                usd_price = Decimal(prices[cc_market]) * cc_rate
+                return {"market": cc_market, "price": str(usd_price), "converted": True}
                 
+        elif b == "CC":
+            market = f"{s}-CC"
             if market in prices:
                 return {"market": market, "price": prices[market]}
-            
-            # Fallback: If asking for USD but only CC pair exists, convert it
+        
+        # 4. Fallback to live Cantex markets
+        response = requests.get(f"{PUBLIC_BASE}/markets/info", timeout=5)
+        response.raise_for_status()
+        markets = response.json().get("data", {}).get("markets", [])
+        
+        for m in markets:
+            symbol = m.get("symbol", "").upper()
+            price = m.get("price")
+            if not price:
+                continue
+                
             if b in {"USD", "USDC"}:
-                cc_market = f"{s}-CC"
-                if cc_market in prices and "CC-USDC" in prices:
-                    try:
-                        cc_rate = Decimal(prices["CC-USDC"])
-                        token_in_cc = Decimal(prices[cc_market])
-                        usd_price = token_in_cc * cc_rate
-                        return {"market": cc_market, "price": str(usd_price), "converted_from_cc": True}
-                    except Exception:
-                        pass
-
-        # 3. LIVE FALLBACK: If not in file, fetch from Cantex directly
-        try:
-            response = requests.get(f"{PUBLIC_BASE}/markets/info", timeout=5)
-            response.raise_for_status()
-            markets = response.json().get("data", {}).get("markets", [])
-            
-            # First try the direct market (e.g., TF-USDT-USDC)
-            for m in markets:
-                if m.get("symbol") == market:
-                    return {"market": market, "price": str(m.get("price", "0"))}
-            
-            # If direct market not found, try CC pair and convert
-            if b in {"USD", "USDC"}:
-                cc_market = f"{s}-CC"
-                for m in markets:
-                    if m.get("symbol") == cc_market:
-                        # Safely get the CC rate from prices or default to 0
-                        cc_rate = Decimal(prices.get("CC-USDC", "0")) if prices else Decimal("0")
-                        if cc_rate > 0:
-                            token_in_cc = Decimal(m.get("price", "0"))
-                            usd_price = token_in_cc * cc_rate
-                            return {"market": cc_market, "price": str(usd_price), "converted_from_cc": True}
-        except Exception:
-            pass
-            
-        return {"error": f"No live price for {market} yet", "price": "0"}
+                if symbol == f"{s}-USDC":
+                    return {"market": symbol, "price": str(price)}
+                if symbol == f"{s}-CC" and cc_rate > 0:
+                    usd_price = Decimal(price) * cc_rate
+                    return {"market": symbol, "price": str(usd_price), "converted": True}
+            elif b == "CC" and symbol == f"{s}-CC":
+                return {"market": symbol, "price": str(price)}
+                
+        return {"error": f"No live price for {s}/{b}", "price": "0"}
     except Exception as e:
         return {"error": str(e), "price": "0"}
+
+
+
 
 @app.get("/api/pool-info")
 def get_pool_info(sell: str, buy: str, action: str = "BUY"):
@@ -367,6 +366,17 @@ async def get_portfolio_value():
             if asyncio.iscoroutine(result):
                 await result
 
+        prices_file = Path(__file__).parent / "prices.json"
+        prices = {}
+        if prices_file.exists():
+            try:
+                with prices_file.open("r") as f:
+                    prices = json.load(f)
+            except Exception:
+                pass
+        
+        cc_rate = Decimal(prices.get("CC-USDC", "0"))
+        
         response = requests.get(f"{PUBLIC_BASE}/markets/info", timeout=5)
         response.raise_for_status()
         markets = response.json().get("data", {}).get("markets", [])
@@ -381,36 +391,27 @@ async def get_portfolio_value():
         total_usd = Decimal("0")
         breakdown = {}
 
-        prices_file = Path(__file__).parent / "prices.json"
-        file_prices = {}
-        if prices_file.exists():
-            try:
-                with prices_file.open("r") as f:
-                    file_prices = json.load(f)
-            except Exception:
-                pass
-
         for token, amount in balances.items():
             if amount <= 0:
                 continue
 
-            usd_price = Decimal("0")
             token_upper = token.upper()
+            usd_price = Decimal("0")
 
-            # 1. Try direct USD/USDC pairs (with USDCX fix)
+            # 1. Try direct USD/USDC
             if f"{token_upper}-USDC" in price_map:
                 usd_price = price_map[f"{token_upper}-USDC"]
             elif f"{token_upper}-USDCX" in price_map:
                 usd_price = price_map[f"{token_upper}-USDCX"]
             # 2. Try CC market and convert
-            elif f"{token_upper}-CC" in price_map and "CC-USDC" in price_map:
-                usd_price = price_map[f"{token_upper}-CC"] * price_map["CC-USDC"]
-            # 3. CC token special case
-            elif token_upper == "CC" and "CC-USDC" in price_map:
-                usd_price = price_map["CC-USDC"]
+            elif f"{token_upper}-CC" in price_map and cc_rate > 0:
+                usd_price = price_map[f"{token_upper}-CC"] * cc_rate
+            # 3. If token is CC, just use the CC rate
+            elif token_upper == "CC" and cc_rate > 0:
+                usd_price = cc_rate
             # 4. Fallback to prices.json
-            elif f"{token_upper}-CC" in file_prices and "CC-USDC" in file_prices:
-                usd_price = Decimal(file_prices[f"{token_upper}-CC"]) * Decimal(file_prices["CC-USDC"])
+            elif f"{token_upper}-CC" in prices and cc_rate > 0:
+                usd_price = Decimal(prices[f"{token_upper}-CC"]) * cc_rate
 
             if usd_price > 0:
                 value = amount * usd_price
