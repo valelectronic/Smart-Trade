@@ -167,7 +167,6 @@ export function OrderForm({ onOrderCreated }: { onOrderCreated: () => void }) {
       console.error("Could not fetch fresh price before submit");
     }
 
-    // Validation using the correct monitor token price
     if (freshPrice > 0) {
       if (action === "SELL" && priceInput < freshPrice) {
         setErrorMsg(`For SELL RISE, target must be ABOVE the price of ${monitorToken} ($${freshPrice.toFixed(5)}).`);
@@ -256,7 +255,10 @@ export function OrderForm({ onOrderCreated }: { onOrderCreated: () => void }) {
     </div>
   );
 
+  // Correct USD calculation based on the Sell Token
   const tradeValueUsd = sellLivePrice > 0 ? amountNum * sellLivePrice : 0;
+  
+  // Real quote output, fallback to local math
   const localExpectedOutput = livePrice > 0 && sellLivePrice > 0 ? (amountNum * sellLivePrice) / livePrice : 0;
   const displayOutput = quoteData ? quoteData.expected_output : localExpectedOutput;
 
@@ -289,8 +291,9 @@ export function OrderForm({ onOrderCreated }: { onOrderCreated: () => void }) {
                   className="w-full bg-onyx border border-jet-black rounded-xl p-3 text-snow font-mono text-right text-lg focus:ring-1 focus:ring-emerald outline-none"
                   value={amount} onChange={(e) => setAmount(e.target.value)}
                 />
+                {/* Fixed: Only show USD if we have a valid sell price */}
                 <div className="text-[10px] text-granite text-right mt-1 pr-1">
-                  ~${tradeValueUsd.toFixed(2)} USD
+                  {sellLivePrice > 0 ? `~$${tradeValueUsd.toFixed(2)} USD` : "Price Unavailable"}
                 </div>
               </div>
             </div>
@@ -321,8 +324,8 @@ export function OrderForm({ onOrderCreated }: { onOrderCreated: () => void }) {
                  <div className="w-full bg-onyx border border-jet-black rounded-xl p-3 text-snow font-mono text-right text-lg text-granite">
                    {isFetchingQuote ? "..." : `~ ${displayOutput.toFixed(4)}`}
                  </div>
+                 {/* Fixed: Strictly show the price of the token being monitored */}
                  <div className="text-[10px] text-emerald text-right mt-1 pr-1">
-                  {/* Show the correct target price based on action */}
                   {action === "BUY" 
                     ? (livePrice > 0 ? `Target: $${livePrice.toFixed(5)}` : "Price Unavailable")
                     : (sellLivePrice > 0 ? `Target: $${sellLivePrice.toFixed(5)}` : "Price Unavailable")}
@@ -383,7 +386,8 @@ export function OrderForm({ onOrderCreated }: { onOrderCreated: () => void }) {
           <div className="flex justify-between items-center">
             <span className="text-[11px] text-granite">Pool Fee</span>
             <span className="text-[11px] text-snow font-mono">
-              {isFetchingQuote ? "..." : (quoteData ? `${(quoteData.pool_fee_percent * 100).toFixed(4)}%` : "---")}
+              {/* Fixed Math: Removed * 100 */}
+              {isFetchingQuote ? "..." : (quoteData ? `${quoteData.pool_fee_percent.toFixed(4)}%` : "---")}
             </span>
           </div>
 

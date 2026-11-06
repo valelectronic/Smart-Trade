@@ -342,17 +342,9 @@ async def get_quote(sell: str, buy: str, amount: str):
 @app.get("/api/portfolio-value")
 async def get_portfolio_value():
     try:
-        # 1. Get balances from the SDK
         client = await connect_sdk()
         account = await client.get_account_info()
         
-        # --- DEBUG START ---
-        tokens_list = getattr(account, "tokens", [])
-        print(f"[DEBUG PORTFOLIO] Account returned {len(tokens_list)} tokens.")
-        for t in tokens_list:
-            print(f"[DEBUG PORTFOLIO] Token: {getattr(t, 'instrument_symbol', 'UNKNOWN')}, Amount: {getattr(t, 'unlocked_amount', 'UNKNOWN')}")
-        # --- DEBUG END ---
-
         balances = {}
         for item in getattr(account, "tokens", []) or []:
             symbol = getattr(item, "instrument_symbol", None)
@@ -366,27 +358,21 @@ async def get_portfolio_value():
             if asyncio.iscoroutine(result):
                 await result
 
-        # 2. Get the live prices map from Cantex
         response = requests.get(f"{PUBLIC_BASE}/markets/info", timeout=5)
         response.raise_for_status()
         markets = response.json().get("data", {}).get("markets", [])
         
-        # --- DEBUG START ---
-        print(f"[DEBUG PORTFOLIO] Fetched {len(markets)} markets from Cantex.")
-        # --- DEBUG END ---
-
+        # Normalize all keys to uppercase
         price_map = {}
         for m in markets:
             symbol = m.get("symbol")
             price = m.get("price")
             if symbol and price:
-                price_map[symbol] = Decimal(price)
+                price_map[symbol.upper()] = Decimal(price)
 
-        # 3. Calculate total value using the same fallback logic as /api/price
         total_usd = Decimal("0")
         breakdown = {}
 
-        # Load prices.json as a secondary fallback
         prices_file = Path(__file__).parent / "prices.json"
         file_prices = {}
         if prices_file.exists():
@@ -401,24 +387,22 @@ async def get_portfolio_value():
                 continue
 
             usd_price = Decimal("0")
+            token_upper = token.upper()
 
-            # Try direct USD market
-            if f"{token}-USDC" in price_map:
-                usd_price = price_map[f"{token}-USDC"]
-            elif f"{token}-USDCX" in price_map:
-                usd_price = price_map[f"{token}-USDCX"]
-            # Try CC market and convert to USD
-            elif f"{token}-CC" in price_map and "CC-USDC" in price_map:
-                usd_price = price_map[f"{token}-CC"] * price_map["CC-USDC"]
-            # Fallback to prices.json
-            elif f"{token}-CC" in file_prices and "CC-USDC" in file_prices:
-                usd_price = Decimal(file_prices[f"{token}-CC"]) * Decimal(file_prices["CC-USDC"])
-            elif token == "CC" and "CC-USDC" in price_map:
+            # 1. Try direct USD or USDC pair
+            if f"{token_upper}-USDC" in price_map:
+                usd_price = price_map[f"{token_upper}-USDC"]
+            elif f"{token_upper}-USD" in price_map:
+                usd_price = price_map[f"{token_upper}-USD"]
+            # 2. Try CC market and convert to USD
+            elif f"{token_upper}-CC" in price_map and "CC-USDC" in price_map:
+                usd_price = price_map[f"{token_upper}-CC"] * price_map["CC-USDC"]
+            # 3. If token is CC, just use the CC-USDC rate
+            elif token_upper == "CC" and "CC-USDC" in price_map:
                 usd_price = price_map["CC-USDC"]
-
-            # --- DEBUG START ---
-            print(f"[DEBUG PORTFOLIO] Token {token}: Amount={amount}, USD Price={usd_price}")
-            # --- DEBUG END ---
+            # 4. Fallback to prices.json
+            elif f"{token_upper}-CC" in file_prices and "CC-USDC" in file_prices:
+                usd_price = Decimal(file_prices[f"{token_upper}-CC"]) * Decimal(file_prices["CC-USDC"])
 
             if usd_price > 0:
                 value = amount * usd_price
