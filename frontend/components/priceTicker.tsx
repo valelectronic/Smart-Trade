@@ -40,11 +40,17 @@ export function PriceTicker({
     const market1 = `${targetToken}-CC`;
     const market2 = `CC-${targetToken}`;
 
-    // Fetch history once (for the chart)
-    fetch(`${apiUrl}/price?sell=${targetToken}&buy=USDC`)
+        // Fetch history once (for the chart)
+    fetch(`${apiUrl}/history?sell=${targetToken}&buy=CC`)
       .then(res => res.json())
-      .then(data => setHistory(data))
-      .catch(() => {});
+      .then(data => {
+        if (Array.isArray(data)) {
+          setHistory(data);
+        } else {
+          setHistory([]);
+        }
+      })
+      .catch(() => setHistory([]));
 
     // Connect to WebSocket for live prices (no polling, no SDK, no 429)
     const ws = new WebSocket(`${wsUrl}/ws/prices`);
