@@ -181,13 +181,12 @@ async def get_price(sell: str, buy: str):
         s = sell.upper()
         b = buy.upper()
         
-        # 1. Stablecoins are always $1
+        # Stablecoins are always $1
         if s in {"USDC", "USDCX"} and b in {"USD", "USDC"}:
             return {"market": f"{s}-{b}", "price": "1.0"}
         if b in {"USDC", "USDCX"} and s in {"USD", "USDC"}:
             return {"market": f"{s}-{b}", "price": "1.0"}
         
-        # 2. Load prices.json
         prices_file = Path(__file__).parent / "prices.json"
         prices = {}
         if prices_file.exists():
@@ -197,18 +196,13 @@ async def get_price(sell: str, buy: str):
             except Exception:
                 pass
 
-        # 3. Get CC-USDC rate
         cc_rate = Decimal(prices.get("CC-USDC", "0"))
-        
         if cc_rate <= 0:
             return {"error": "CC rate not available", "price": "0"}
 
-        # 4. Determine the market
         if b in {"USD", "USDC"}:
             if f"{s}-USDC" in prices:
                 return {"market": f"{s}-USDC", "price": prices[f"{s}-USDC"]}
-            if f"{s}-USDCX" in prices:
-                return {"market": f"{s}-USDCX", "price": prices[f"{s}-USDCX"]}
             if f"{s}-CC" in prices:
                 usd_price = Decimal(prices[f"{s}-CC"]) * cc_rate
                 return {"market": f"{s}-CC", "price": str(usd_price), "converted": True}

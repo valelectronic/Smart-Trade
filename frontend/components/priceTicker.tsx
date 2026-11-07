@@ -28,37 +28,25 @@ export function PriceTicker({
     setStatus("loading");
 
     const targetToken = buyToken.toUpperCase(); 
-    
     if (targetToken === "CC") {
       setStatus("unavailable");
       return;
     }
 
     const apiUrl = process.env.NEXT_PUBLIC_API_URL || "http://127.0.0.1:8000/api";
-    const wsUrl = apiUrl.replace("https://", "wss://").replace("http://", "ws://").replace("/api", "");
 
-    const market1 = `${targetToken}-CC`;
-    const market2 = `CC-${targetToken}`;
-
-        // Fetch history once (for the chart)
+    // Fetch history
     fetch(`${apiUrl}/history?sell=${targetToken}&buy=CC`)
       .then(res => res.json())
-      .then(data => {
-        if (Array.isArray(data)) {
-          setHistory(data);
-        } else {
-          setHistory([]);
-        }
-      })
+      .then(data => setHistory(Array.isArray(data) ? data : []))
       .catch(() => setHistory([]));
 
-    // Connect to WebSocket for live prices (no polling, no SDK, no 429)
-    const ws = new WebSocket(`${wsUrl}/ws/prices`);
-
-    ws.onmessage = (event) => {
+    // Fetch live price (polling every 2 seconds)
+    const fetchPrices = async () => {
       try {
-        const data = JSON.parse(event.data);
-        if (data.market === market1 || data.market === market2) {
+        const res = await fetch(`${apiUrl}/price?sell=${targetToken}&buy=USDC`);
+        const data = await res.json();
+        if (data.price && data.price !== "0") {
           const newPrice = parseFloat(data.price);
           setPrice((currentPrice) => {
             if (currentPrice !== null) setPrevPrice(currentPrice);
@@ -69,22 +57,14 @@ export function PriceTicker({
       } catch (err) {}
     };
 
-    const timeoutId = setTimeout(() => {
-      setStatus((currentStatus) => {
-        if (currentStatus === "loading") return "unavailable";
-        return currentStatus;
-      });
-    }, 8000);
+    fetchPrices();
+    const interval = setInterval(fetchPrices, 2000);
 
-    return () => {
-      ws.close();
-      clearTimeout(timeoutId);
-    };
+    return () => clearInterval(interval);
   }, [sellToken, buyToken, action]);
 
   const isUp = prevPrice !== null && price !== null && price > prevPrice;
   const isDown = prevPrice !== null && price !== null && price < prevPrice;
-  
   const displayToken = buyToken.toUpperCase();
 
   return (
@@ -104,7 +84,7 @@ export function PriceTicker({
 
         <div className="flex items-center gap-2 shrink-0 sm:justify-end">
           {status === "loading" && (
-            <span className="text-xs sm:text-sm text-granite animate-pulse">Connecting...</span>
+            <span className="text-xs sm:text-sm text-granite animate-pulse">Fetching...</span>
           )}
           {status === "unavailable" && (
             <span className="text-[10px] sm:text-xs text-red-400 font-medium bg-red-500/10 px-2 py-1 rounded">Price Unavailable</span>
