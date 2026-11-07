@@ -177,7 +177,6 @@ def get_markets():
 
 @app.get("/api/price")
 async def get_price(sell: str, buy: str):
-    global _price_cache, _last_price_fetch
     try:
         s = sell.upper()
         b = buy.upper()
@@ -201,51 +200,10 @@ async def get_price(sell: str, buy: str):
         # 3. Get CC-USDC rate
         cc_rate = Decimal(prices.get("CC-USDC", "0"))
         
-        # 4. If CC rate is missing, try the SDK (cached for 60 seconds)
-        if cc_rate <= 0:
-            cache_key = "CC-USDC"
-            now = time.monotonic()
-            if cache_key in _price_cache and now - _last_price_fetch < 60:
-                cc_rate = Decimal(_price_cache[cache_key])
-            else:
-                async with _price_lock:
-                    if cache_key in _price_cache and now - _last_price_fetch < 60:
-                        cc_rate = Decimal(_price_cache[cache_key])
-                    else:
-                        try:
-                            client = await connect_sdk()
-                            account_admin = await client.get_account_admin()
-                            instruments = {}
-                            for item in getattr(account_admin, "instruments", []) or []:
-                                symbol = getattr(item, "instrument_symbol", None)
-                                instrument = getattr(item, "instrument", None)
-                                if symbol and instrument is not None:
-                                    instruments[str(symbol).upper()] = instrument
-                            
-                            if "CC" in instruments and "USDC" in instruments:
-                                quote = await client.get_swap_quote(
-                                    sell_amount=Decimal("1"),
-                                    sell_instrument=instruments["CC"],
-                                    buy_instrument=instruments["USDC"],
-                                )
-                                returned_obj = getattr(quote, "returned", None)
-                                if returned_obj is not None:
-                                    cc_rate = Decimal(str(getattr(returned_obj, "amount", 0)))
-                                    _price_cache[cache_key] = str(cc_rate)
-                                    _last_price_fetch = time.monotonic()
-                            
-                            close = getattr(client, "close", None)
-                            if close:
-                                result = close()
-                                if asyncio.iscoroutine(result):
-                                    await result
-                        except Exception as e:
-                            print(f"[PRICE SDK ERROR] {e}")
-        
         if cc_rate <= 0:
             return {"error": "CC rate not available", "price": "0"}
 
-        # 5. Determine the market
+        # 4. Determine the market
         if b in {"USD", "USDC"}:
             if f"{s}-USDC" in prices:
                 return {"market": f"{s}-USDC", "price": prices[f"{s}-USDC"]}

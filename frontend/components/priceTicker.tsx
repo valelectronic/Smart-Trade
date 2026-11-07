@@ -41,7 +41,7 @@ export function PriceTicker({
     const market2 = `CC-${targetToken}`;
 
     // Fetch history once (for the chart)
-    fetch(`${apiUrl}/history?sell=${targetToken}&buy=CC`)
+    fetch(`${apiUrl}/price?sell=${targetToken}&buy=USDC`)
       .then(res => res.json())
       .then(data => setHistory(data))
       .catch(() => {});
