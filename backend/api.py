@@ -151,14 +151,6 @@ def health():
     return {"status": "ok"}
 
 
-@app.get("/api/debug-prices")
-def debug_prices():
-    prices_file = Path(__file__).parent / "prices.json"
-    if prices_file.exists():
-        with prices_file.open("r") as f:
-            return {"content": f.read()}
-    return {"content": "File does not exist"}
-
 
 @app.get("/api/markets")
 def get_markets():
@@ -205,16 +197,13 @@ async def get_price(sell: str, buy: str):
             except Exception:
                 pass
 
-        cc_rate = Decimal(prices.get("CC-USDC", "0"))
-        if cc_rate <= 0:
-            return {"error": "CC rate not available", "price": "0"}
-
         if b in {"USD", "USDC"}:
+            # Check direct USDC pair
             if f"{s}-USDC" in prices:
                 return {"market": f"{s}-USDC", "price": prices[f"{s}-USDC"]}
+            # Check CC pair (value is already USD)
             if f"{s}-CC" in prices:
-                usd_price = Decimal(prices[f"{s}-CC"]) * cc_rate
-                return {"market": f"{s}-CC", "price": str(usd_price), "converted": True}
+                return {"market": f"{s}-CC", "price": prices[f"{s}-CC"]}
         elif b == "CC":
             if f"{s}-CC" in prices:
                 return {"market": f"{s}-CC", "price": prices[f"{s}-CC"]}
@@ -385,14 +374,10 @@ async def get_portfolio_value():
 
             if f"{token_upper}-USDC" in prices:
                 usd_price = Decimal(prices[f"{token_upper}-USDC"])
-            elif f"{token_upper}-USDCX" in prices:
-                usd_price = Decimal(prices[f"{token_upper}-USDCX"])
             elif f"{token_upper}-CC" in prices:
-                usd_price = Decimal(prices[f"{token_upper}-CC"]) * cc_rate
+                usd_price = Decimal(prices[f"{token_upper}-CC"])
             elif token_upper == "CC":
-                usd_price = cc_rate
-            elif token_upper == "USDCX":
-                usd_price = Decimal("1")
+                usd_price = Decimal(prices.get("CC-USDC", "0"))
 
             if usd_price > 0:
                 value = amount * usd_price
