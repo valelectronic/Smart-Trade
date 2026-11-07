@@ -40,36 +40,13 @@ export function PriceTicker({
     const market1 = `${targetToken}-CC`;
     const market2 = `CC-${targetToken}`;
 
-    fetch(`${apiUrl}/subscribe?market=${market1}`, { method: "POST" }).catch(console.error);
-    fetch(`${apiUrl}/subscribe?market=${market2}`, { method: "POST" }).catch(console.error);
+    // Fetch history once (for the chart)
+    fetch(`${apiUrl}/history?sell=${targetToken}&buy=CC`)
+      .then(res => res.json())
+      .then(data => setHistory(data))
+      .catch(() => {});
 
-    const fetchHistory = async () => {
-      try {
-        const res = await fetch(`${apiUrl}/history?sell=${targetToken}&buy=CC`);
-        const data = await res.json();
-        setHistory(data);
-      } catch (error) {}
-    };
-    fetchHistory();
-
-    const fetchPrices = async () => {
-      try {
-        const res = await fetch(`${apiUrl}/price?sell=${targetToken}&buy=CC`);
-        const data = await res.json();
-        if (data.price && data.price !== "0") {
-          const newPrice = parseFloat(data.price);
-          setPrice((currentPrice) => {
-            if (currentPrice !== null) setPrevPrice(currentPrice);
-            return newPrice;
-          });
-          setStatus("ready");
-        }
-      } catch (err) {}
-    };
-
-    fetchPrices();
-    const interval = setInterval(fetchPrices, 2000);
-
+    // Connect to WebSocket for live prices (no polling, no SDK, no 429)
     const ws = new WebSocket(`${wsUrl}/ws/prices`);
 
     ws.onmessage = (event) => {
@@ -95,7 +72,6 @@ export function PriceTicker({
 
     return () => {
       ws.close();
-      clearInterval(interval);
       clearTimeout(timeoutId);
     };
   }, [sellToken, buyToken, action]);
@@ -105,12 +81,9 @@ export function PriceTicker({
   
   const displayToken = buyToken.toUpperCase();
 
-    return (
+  return (
     <Card className="bg-carbon border-jet-black mb-4 p-0 overflow-hidden flex flex-col">
-      
-      {/* TOP SECTION */}
       <div className="p-3 sm:p-4 flex flex-col sm:flex-row sm:items-center justify-between border-b border-jet-black/50 gap-2">
-        
         <div className="flex items-center gap-3 min-w-0">
           <div className="p-2 bg-jet-black rounded-lg shrink-0">
             <Activity size={16} className={status === "loading" ? "text-emerald animate-pulse" : "text-granite"} />
@@ -125,14 +98,13 @@ export function PriceTicker({
 
         <div className="flex items-center gap-2 shrink-0 sm:justify-end">
           {status === "loading" && (
-            <span className="text-xs sm:text-sm text-granite animate-pulse">Fetching...</span>
+            <span className="text-xs sm:text-sm text-granite animate-pulse">Connecting...</span>
           )}
           {status === "unavailable" && (
             <span className="text-[10px] sm:text-xs text-red-400 font-medium bg-red-500/10 px-2 py-1 rounded">Price Unavailable</span>
           )}
           {status === "ready" && (
             <>
-              {/* Changed: Removed break-all, used truncate, adjusted font size */}
               <span className={`text-xl sm:text-2xl md:text-3xl font-mono font-bold truncate transition-colors duration-300 ${isUp ? 'text-emerald' : isDown ? 'text-red-400' : 'text-snow'}`}>
                 ${price ? price.toFixed(5) : "0.00000"}
               </span>
@@ -143,7 +115,6 @@ export function PriceTicker({
         </div>
       </div>
       
-      {/* CHART SECTION */}
       <div className="h-20 sm:h-24 w-full bg-onyx-dark/30">
         <ResponsiveContainer width="100%" height="100%">
           <AreaChart data={history} margin={{ top: 5, right: 0, left: 0, bottom: 0 }}>

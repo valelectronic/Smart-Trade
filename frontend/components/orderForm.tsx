@@ -85,8 +85,12 @@ export function OrderForm({ onOrderCreated }: { onOrderCreated: () => void }) {
     }).catch(() => toast.error("Could not load market data."));
   }, []);
 
+  // Fetch prices (reset first to avoid wrong cached price)
   useEffect(() => {
     if (sellToken && buyToken && sellToken !== buyToken) {
+      setLivePrice(0);
+      setSellLivePrice(0);
+
       getLivePrice(buyToken, "USDC").then(data => {
         setLivePrice(data.price && data.price !== "0" ? parseFloat(data.price) : 0);
       }).catch(() => setLivePrice(0));
@@ -97,22 +101,13 @@ export function OrderForm({ onOrderCreated }: { onOrderCreated: () => void }) {
     }
   }, [sellToken, buyToken]);
 
-
-
-      // Fetch quote from backend
+  // Fetch quote (debounced, no amountNum dependency)
   useEffect(() => {
-    if (!sellToken || !buyToken || sellToken === buyToken) {
+    if (!sellToken || !buyToken || sellToken === buyToken || amountNum <= 0) {
       setQuoteData(null);
       return;
     }
 
-    // If the amount is empty, clear the quote immediately
-    if (amountNum <= 0) {
-      setQuoteData(null);
-      return;
-    }
-
-    // DEBOUNCE: Wait 1 second after the user stops typing
     const timeoutId = setTimeout(() => {
       setIsFetchingQuote(true);
       fetch(`${process.env.NEXT_PUBLIC_API_URL}/quote?sell=${sellToken}&buy=${buyToken}&amount=${amount}`)
@@ -130,7 +125,6 @@ export function OrderForm({ onOrderCreated }: { onOrderCreated: () => void }) {
 
     return () => clearTimeout(timeoutId);
   }, [sellToken, buyToken, amount, action]);
-
 
   useEffect(() => {
     function handleClickOutside(event: MouseEvent) {
@@ -174,13 +168,17 @@ export function OrderForm({ onOrderCreated }: { onOrderCreated: () => void }) {
     const monitorToken = action === "BUY" ? buyToken : sellToken;
     let freshPrice = action === "BUY" ? livePrice : sellLivePrice;
 
-    try {
-      const priceData = await getLivePrice(monitorToken, "USDC");
-      if (priceData.price && priceData.price !== "0") {
-        freshPrice = parseFloat(priceData.price);
+    if (freshPrice === 0) {
+      try {
+        const priceData = await getLivePrice(monitorToken, "USDC");
+        if (priceData.price && priceData.price !== "0") {
+          freshPrice = parseFloat(priceData.price);
+          if (action === "BUY") setLivePrice(freshPrice);
+          else setSellLivePrice(freshPrice);
+        }
+      } catch (err) {
+        console.error("Could not fetch fresh price before submit");
       }
-    } catch (err) {
-      console.error("Could not fetch fresh price before submit");
     }
 
     if (freshPrice > 0) {
@@ -271,10 +269,7 @@ export function OrderForm({ onOrderCreated }: { onOrderCreated: () => void }) {
     </div>
   );
 
-  // Correct USD calculation based on the Sell Token
   const tradeValueUsd = sellLivePrice > 0 ? amountNum * sellLivePrice : 0;
-  
-  // Real quote output, fallback to local math
   const localExpectedOutput = livePrice > 0 && sellLivePrice > 0 ? (amountNum * sellLivePrice) / livePrice : 0;
   const displayOutput = quoteData ? quoteData.expected_output : localExpectedOutput;
 
@@ -307,7 +302,6 @@ export function OrderForm({ onOrderCreated }: { onOrderCreated: () => void }) {
                   className="w-full bg-onyx border border-jet-black rounded-xl p-3 text-snow font-mono text-right text-lg focus:ring-1 focus:ring-emerald outline-none"
                   value={amount} onChange={(e) => setAmount(e.target.value)}
                 />
-                {/* Fixed: Only show USD if we have a valid sell price */}
                 <div className="text-[10px] text-granite text-right mt-1 pr-1">
                   {sellLivePrice > 0 ? `~$${tradeValueUsd.toFixed(2)} USD` : "Price Unavailable"}
                 </div>
@@ -340,7 +334,6 @@ export function OrderForm({ onOrderCreated }: { onOrderCreated: () => void }) {
                  <div className="w-full bg-onyx border border-jet-black rounded-xl p-3 text-snow font-mono text-right text-lg text-granite">
                    {isFetchingQuote ? "..." : `~ ${displayOutput.toFixed(4)}`}
                  </div>
-                 {/* Fixed: Strictly show the price of the token being monitored */}
                  <div className="text-[10px] text-emerald text-right mt-1 pr-1">
                   {action === "BUY" 
                     ? (livePrice > 0 ? `Target: $${livePrice.toFixed(5)}` : "Price Unavailable")
@@ -402,7 +395,6 @@ export function OrderForm({ onOrderCreated }: { onOrderCreated: () => void }) {
           <div className="flex justify-between items-center">
             <span className="text-[11px] text-granite">Pool Fee</span>
             <span className="text-[11px] text-snow font-mono">
-              {/* Fixed Math: Removed * 100 */}
               {isFetchingQuote ? "..." : (quoteData ? `${quoteData.pool_fee_percent.toFixed(4)}%` : "---")}
             </span>
           </div>

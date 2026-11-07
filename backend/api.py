@@ -7,8 +7,6 @@ import uuid
 import json
 import asyncio
 import time
-_last_quote_time = 0
-_quote_lock = asyncio.Lock()
 from pathlib import Path
 from contextlib import asynccontextmanager
 from decimal import Decimal
@@ -23,6 +21,15 @@ from helpers import get_token_balance
 
 from postgres_database import add_order, delete_order, get_all_orders, init_db
 from config import PUBLIC_BASE
+
+# --- Price Cache ---
+_price_cache = {}
+_last_price_fetch = 0
+_price_lock = asyncio.Lock()
+
+# --- Quote Rate Limiter ---
+_last_quote_time = 0
+_quote_lock = asyncio.Lock()
 
 
 @asynccontextmanager
@@ -51,7 +58,6 @@ app.add_middleware(
 )
 
 
-# Global queue to communicate with the monitor
 subscription_queue = asyncio.Queue()
 
 
@@ -108,30 +114,24 @@ class OrderCreate(BaseModel):
         route_token = None
         market = ""
 
-        # --- THE FIX: Robust routing that never throws a 422 ---
         if self.action == "BUY":
             monitor_token = buy_token
         else:
             monitor_token = sell_token
 
-        # 1. Try direct pairs first
         if f"{sell_token}-{buy_token}" in valid_symbols:
             market = f"{sell_token}-{buy_token}"
         elif f"{buy_token}-{sell_token}" in valid_symbols:
             market = f"{buy_token}-{sell_token}"
-        # 2. Try the buy token CC market
         elif f"{buy_token}-CC" in valid_symbols:
             market = f"{buy_token}-CC"
             route_token = sell_token
-        # 3. Try the sell token CC market
         elif f"{sell_token}-CC" in valid_symbols:
             market = f"{sell_token}-CC"
             route_token = buy_token
-        # 4. Force the buy token CC market (trust the SDK)
         else:
             market = f"{buy_token}-CC"
             route_token = sell_token
-        # --- END OF FIX ---
 
         return {
             "id": self.id or uuid.uuid4().hex,
@@ -176,11 +176,19 @@ def get_markets():
 
 
 @app.get("/api/price")
-def get_price(sell: str, buy: str):
+async def get_price(sell: str, buy: str):
+    global _price_cache, _last_price_fetch
     try:
         s = sell.upper()
         b = buy.upper()
         
+        # 1. Stablecoins are always $1
+        if s in {"USDC", "USDCX"} and b in {"USD", "USDC"}:
+            return {"market": f"{s}-{b}", "price": "1.0"}
+        if b in {"USDC", "USDCX"} and s in {"USD", "USDC"}:
+            return {"market": f"{s}-{b}", "price": "1.0"}
+        
+        # 2. Load prices.json
         prices_file = Path(__file__).parent / "prices.json"
         prices = {}
         if prices_file.exists():
@@ -190,26 +198,62 @@ def get_price(sell: str, buy: str):
             except Exception:
                 pass
 
-        # The master key: CC to USD
+        # 3. Get CC-USDC rate
         cc_rate = Decimal(prices.get("CC-USDC", "0"))
+        
+        # 4. If CC rate is missing, try the SDK (cached for 60 seconds)
+        if cc_rate <= 0:
+            cache_key = "CC-USDC"
+            now = time.monotonic()
+            if cache_key in _price_cache and now - _last_price_fetch < 60:
+                cc_rate = Decimal(_price_cache[cache_key])
+            else:
+                async with _price_lock:
+                    if cache_key in _price_cache and now - _last_price_fetch < 60:
+                        cc_rate = Decimal(_price_cache[cache_key])
+                    else:
+                        try:
+                            client = await connect_sdk()
+                            account_admin = await client.get_account_admin()
+                            instruments = {}
+                            for item in getattr(account_admin, "instruments", []) or []:
+                                symbol = getattr(item, "instrument_symbol", None)
+                                instrument = getattr(item, "instrument", None)
+                                if symbol and instrument is not None:
+                                    instruments[str(symbol).upper()] = instrument
+                            
+                            if "CC" in instruments and "USDC" in instruments:
+                                quote = await client.get_swap_quote(
+                                    sell_amount=Decimal("1"),
+                                    sell_instrument=instruments["CC"],
+                                    buy_instrument=instruments["USDC"],
+                                )
+                                returned_obj = getattr(quote, "returned", None)
+                                if returned_obj is not None:
+                                    cc_rate = Decimal(str(getattr(returned_obj, "amount", 0)))
+                                    _price_cache[cache_key] = str(cc_rate)
+                                    _last_price_fetch = time.monotonic()
+                            
+                            close = getattr(client, "close", None)
+                            if close:
+                                result = close()
+                                if asyncio.iscoroutine(result):
+                                    await result
+                        except Exception as e:
+                            print(f"[PRICE SDK ERROR] {e}")
         
         if cc_rate <= 0:
             return {"error": "CC rate not available", "price": "0"}
 
-        # 1. If asking for USD/USDC, we need the token's USD price
+        # 5. Determine the market
         if b in {"USD", "USDC"}:
-            # Check direct USDC pair
             if f"{s}-USDC" in prices:
                 return {"market": f"{s}-USDC", "price": prices[f"{s}-USDC"]}
-            # Check USDCX pair
             if f"{s}-USDCX" in prices:
                 return {"market": f"{s}-USDCX", "price": prices[f"{s}-USDCX"]}
-            # Check CC pair and convert
             if f"{s}-CC" in prices:
                 usd_price = Decimal(prices[f"{s}-CC"]) * cc_rate
                 return {"market": f"{s}-CC", "price": str(usd_price), "converted": True}
-        
-        # 2. If asking for CC, just return the CC price
         elif b == "CC":
             if f"{s}-CC" in prices:
                 return {"market": f"{s}-CC", "price": prices[f"{s}-CC"]}
@@ -217,8 +261,6 @@ def get_price(sell: str, buy: str):
         return {"error": f"No price for {s}/{b}", "price": "0"}
     except Exception as e:
         return {"error": str(e), "price": "0"}
-
-
 
 
 @app.get("/api/pool-info")
@@ -250,14 +292,12 @@ def get_pool_info(sell: str, buy: str, action: str = "BUY"):
 
 @app.get("/api/quote")
 async def get_quote(sell: str, buy: str, amount: str):
-    # --- RATE LIMITER START ---
     global _last_quote_time
     async with _quote_lock:
         now = time.monotonic()
         if now - _last_quote_time < 1.0:
             await asyncio.sleep(1.0 - (now - _last_quote_time))
         _last_quote_time = time.monotonic()
-    # --- RATE LIMITER END ---
 
     try:
         s = sell.upper()
@@ -340,10 +380,10 @@ async def get_quote(sell: str, buy: str, amount: str):
     except Exception as e:
         return {"error": str(e), "status": "failed"}
 
+
 @app.get("/api/portfolio-value")
 async def get_portfolio_value():
     try:
-        # 1. Get balances (this uses the SDK once, which is fine)
         client = await connect_sdk()
         account = await client.get_account_info()
         balances = {}
@@ -359,7 +399,6 @@ async def get_portfolio_value():
             if asyncio.iscoroutine(result):
                 await result
 
-        # 2. Load prices.json (the engine updates this every second)
         prices_file = Path(__file__).parent / "prices.json"
         prices = {}
         if prices_file.exists():
@@ -383,18 +422,14 @@ async def get_portfolio_value():
             token_upper = token.upper()
             usd_price = Decimal("0")
 
-            # 1. Direct USDC/USDCX
             if f"{token_upper}-USDC" in prices:
                 usd_price = Decimal(prices[f"{token_upper}-USDC"])
             elif f"{token_upper}-USDCX" in prices:
                 usd_price = Decimal(prices[f"{token_upper}-USDCX"])
-            # 2. CC pair, convert to USD
             elif f"{token_upper}-CC" in prices:
                 usd_price = Decimal(prices[f"{token_upper}-CC"]) * cc_rate
-            # 3. CC token itself
             elif token_upper == "CC":
                 usd_price = cc_rate
-            # 4. USDCX peg
             elif token_upper == "USDCX":
                 usd_price = Decimal("1")
 
