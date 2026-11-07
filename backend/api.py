@@ -151,6 +151,15 @@ def health():
     return {"status": "ok"}
 
 
+@app.get("/api/debug-prices")
+def debug_prices():
+    prices_file = Path(__file__).parent / "prices.json"
+    if prices_file.exists():
+        with prices_file.open("r") as f:
+            return {"content": f.read()}
+    return {"content": "File does not exist"}
+
+
 @app.get("/api/markets")
 def get_markets():
     try:
