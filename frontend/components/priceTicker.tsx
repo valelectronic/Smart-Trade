@@ -65,7 +65,7 @@ export function PriceTicker({
 
   const isUp = prevPrice !== null && price !== null && price > prevPrice;
   const isDown = prevPrice !== null && price !== null && price < prevPrice;
-const displayToken = (action === "BUY" ? buyToken : sellToken).toUpperCase();
+ const displayToken = (action === "BUY" ? buyToken : sellToken).toUpperCase();
 
   return (
     <Card className="bg-carbon border-jet-black mb-4 p-0 overflow-hidden flex flex-col">
