@@ -68,7 +68,7 @@ export function PriceTicker({
  const displayToken = (action === "BUY" ? buyToken : sellToken).toUpperCase();
 
   return (
-    <Card className="bg-carbon border-jet-black mb-4 p-0 overflow-hidden flex flex-col">
+    <Card key={price} className="bg-carbon border-jet-black mb-4 p-0 overflow-hidden flex flex-col">
       <div className="p-3 sm:p-4 flex flex-col sm:flex-row sm:items-center justify-between border-b border-jet-black/50 gap-2">
         <div className="flex items-center gap-3 min-w-0">
           <div className="p-2 bg-jet-black rounded-lg shrink-0">
