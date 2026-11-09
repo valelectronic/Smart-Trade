@@ -26,6 +26,8 @@ from config import PUBLIC_BASE
 _price_cache = {}
 _last_price_fetch = 0
 _price_lock = asyncio.Lock()
+# --- Quote Cache ---
+_quote_cache = {}
 
 # --- Quote Rate Limiter ---
 _last_quote_time = 0
@@ -161,15 +163,14 @@ def get_markets():
         
         valid_markets = []
         for m in markets:
-            if m.get("source") == "cantex":
-                symbol = m.get("symbol", "")
-                parts = symbol.split("-")
-                if len(parts) == 2:
-                    valid_markets.append({
-                        "symbol": symbol,
-                        "base": parts[0],
-                        "quote": parts[1]
-                    })
+            symbol = m.get("symbol", "")
+            parts = symbol.split("-")
+            if len(parts) == 2:
+                valid_markets.append({
+                    "symbol": symbol,
+                    "base": parts[0],
+                    "quote": parts[1]
+                })
         
         return sorted(valid_markets, key=lambda x: x["symbol"])
     except Exception as e:
@@ -238,11 +239,17 @@ def get_pool_info(sell: str, buy: str, action: str = "BUY"):
 
 @app.get("/api/quote")
 async def get_quote(sell: str, buy: str, amount: str):
-    global _last_quote_time
+    global _last_quote_time, _quote_cache
     async with _quote_lock:
         now = time.monotonic()
-        if now - _last_quote_time < 1.0:
-            await asyncio.sleep(1.0 - (now - _last_quote_time))
+        cache_key = f"{sell.upper()}-{buy.upper()}-{amount}"
+        
+        # 2-second cache
+        if cache_key in _quote_cache and now - _last_quote_time < 2.0:
+            return _quote_cache[cache_key]
+        
+        if now - _last_quote_time < 2.0:
+            await asyncio.sleep(2.0 - (now - _last_quote_time))
         _last_quote_time = time.monotonic()
 
     try:
@@ -315,7 +322,7 @@ async def get_quote(sell: str, buy: str, amount: str):
         except Exception as parse_err:
             print(f"[QUOTE PARSE ERROR] {parse_err}")
 
-        return {
+        result = {
             "expected_output": output,
             "network_fee_cc": network_fee,
             "pool_fee_percent": pool_fee,
@@ -323,8 +330,17 @@ async def get_quote(sell: str, buy: str, amount: str):
             "pool_size_cc": pool_size,
             "status": "success"
         }
+        _quote_cache[cache_key] = result
+        return result
     except Exception as e:
         return {"error": str(e), "status": "failed"}
+
+
+@app.get("/api/order-quote")
+async def get_order_quote(sell: str, buy: str, amount: str):
+    # Reuse the exact same logic as /api/quote
+    # It has the 2-second cache, so it is safe to call every 5 seconds
+    return await get_quote(sell, buy, amount)
 
 
 @app.get("/api/portfolio-value")

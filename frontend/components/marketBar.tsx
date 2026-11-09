@@ -8,9 +8,9 @@ export function MarketBar() {
   const [ccPrice, setCcPrice] = useState<number | null>(null);
 
   useEffect(() => {
-    // Determine the API and WebSocket URLs dynamically
-   const apiUrl = process.env.NEXT_PUBLIC_API_URL || "http://127.0.0.1:8000/api";
-const wsUrl = apiUrl.replace("https://", "wss://").replace("http://", "ws://").replace("/api", "");
+    const apiUrl = process.env.NEXT_PUBLIC_API_URL || "http://127.0.0.1:8000/api";
+    const wsUrl = apiUrl.replace("https://", "wss://").replace("http://", "ws://").replace("/api", "");
+
     // Polling fallback (ensures prices always update)
     const fetchPrices = async () => {
       try {
@@ -45,19 +45,19 @@ const wsUrl = apiUrl.replace("https://", "wss://").replace("http://", "ws://").r
   }, []);
 
   return (
-    <div className="flex items-center gap-6 bg-onyx border-b border-shadow-grey px-4 md:px-8 py-2 text-sm font-mono overflow-x-auto whitespace-nowrap no-scrollbar">
-      <div className="flex items-center gap-2">
-        <Bitcoin size={16} className="text-amber-500" />
+    <div className="flex items-center justify-between bg-onyx border-b border-shadow-grey px-4 md:px-8 py-2 text-xs md:text-sm font-mono w-full overflow-hidden">
+      <div className="flex items-center gap-1.5 md:gap-2">
+        <Bitcoin size={14} className="text-amber-500 shrink-0 md:w-4 md:h-4" />
         <span className="text-granite">BTC/USD</span>
         <span className="text-snow font-bold">
-          ${btcPrice ? btcPrice.toLocaleString(undefined, { minimumFractionDigits: 2 }) : "Loading..."}
+          {btcPrice ? `$${btcPrice.toLocaleString(undefined, { minimumFractionDigits: 2 })}` : "Loading..."}
         </span>
       </div>
-      <div className="flex items-center gap-2">
-        <Coins size={16} className="text-emerald" />
+      <div className="flex items-center gap-1.5 md:gap-2">
+        <Coins size={14} className="text-emerald shrink-0 md:w-4 md:h-4" />
         <span className="text-granite">CC/USDC</span>
         <span className="text-snow font-bold">
-          ${ccPrice ? ccPrice.toFixed(5) : "Loading..."}
+          {ccPrice ? `$${ccPrice.toFixed(5)}` : "Loading..."}
         </span>
       </div>
     </div>

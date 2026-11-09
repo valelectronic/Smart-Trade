@@ -1,12 +1,58 @@
 "use client";
 
-import { useState, useEffect, useRef } from "react";
+import { useState, useEffect, useRef, memo } from "react";
 import { toast } from "sonner";
 import { createOrder, getMarkets, getBalances, getLivePrice } from "@/lib/api";
 import { Card } from "./ui/card";
 import { Button } from "./ui/Button";
 import { ChevronDown, ArrowUpDown, AlertCircle, Clock, ShieldCheck } from "lucide-react";
 import { PriceTicker } from "./priceTicker";
+
+// --- FIX 1: Memoize the TokenDropdown to prevent scroll reset ---
+const TokenDropdown = memo(({ selected, onSelect, isOpen, setIsOpen, refObj, availableTokens, balances }: { 
+  selected: string, 
+  onSelect: (t: string) => void, 
+  isOpen: boolean, 
+  setIsOpen: (b: boolean) => void, 
+  refObj: React.RefObject<HTMLDivElement | null>,
+  availableTokens: string[],
+  balances: Record<string, string>
+}) => {
+  return (
+    <div ref={refObj} className="relative">
+      <button
+        type="button"
+        onClick={() => setIsOpen(!isOpen)}
+        className="w-full bg-carbon border border-jet-black rounded-xl p-3 text-snow font-mono text-xs md:text-sm flex justify-between items-center focus:ring-1 focus:ring-emerald outline-none"
+      >
+        {/* Changed: Removed truncate, added break-all so it wraps to 2 lines if needed */}
+        <span className="break-all text-left pr-2">
+          {selected || "Select Token..."}
+        </span>
+        <ChevronDown size={16} className="text-granite shrink-0" />
+      </button>
+
+      {isOpen && (
+        <div className="absolute top-full left-0 mt-1 w-full max-h-60 overflow-y-auto bg-carbon border border-jet-black rounded-xl shadow-xl z-50">
+          {availableTokens.map((t) => (
+            <button
+              key={t}
+              type="button"
+              onClick={() => { onSelect(t); setIsOpen(false); }}
+              className={`w-full text-left px-4 py-3 text-sm font-mono flex items-center justify-between hover:bg-jet-black transition-colors ${selected === t ? 'text-emerald' : 'text-granite'}`}
+            >
+              {/* Changed: break-all so the token name wraps instead of truncating */}
+              <span className="break-all pr-2">{t}</span>
+              <span className="text-xs text-granite shrink-0">{balances[t] ? parseFloat(balances[t]).toFixed(4) : "0.00"}</span>
+            </button>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+});
+
+TokenDropdown.displayName = "TokenDropdown";
 
 export function OrderForm({ onOrderCreated }: { onOrderCreated: () => void }) {
   const [isLoading, setIsLoading] = useState(false);
@@ -240,35 +286,6 @@ export function OrderForm({ onOrderCreated }: { onOrderCreated: () => void }) {
     </label>
   );
 
-  const TokenDropdown = ({ selected, onSelect, isOpen, setIsOpen, refObj }: { selected: string, onSelect: (t: string) => void, isOpen: boolean, setIsOpen: (b: boolean) => void, refObj: React.RefObject<HTMLDivElement | null> }) => (
-    <div ref={refObj} className="relative">
-      <button
-        type="button"
-        onClick={() => setIsOpen(!isOpen)}
-        className="w-full bg-carbon border border-jet-black rounded-xl p-3 text-snow font-mono text-sm flex justify-between items-center focus:ring-1 focus:ring-emerald outline-none truncate"
-      >
-        <span className="truncate">{selected || "Select Token..."}</span>
-        <ChevronDown size={16} className="text-granite shrink-0" />
-      </button>
-
-      {isOpen && (
-        <div className="absolute top-full left-0 mt-1 w-full max-h-60 overflow-y-auto bg-carbon border border-jet-black rounded-xl shadow-xl z-50">
-          {availableTokens.map((t) => (
-            <button
-              key={t}
-              type="button"
-              onClick={() => { onSelect(t); setIsOpen(false); }}
-              className={`w-full text-left px-4 py-3 text-sm font-mono flex items-center justify-between hover:bg-jet-black transition-colors ${selected === t ? 'text-emerald' : 'text-granite'}`}
-            >
-              <span className="truncate">{t}</span>
-              <span className="text-xs text-granite">{balances[t] ? parseFloat(balances[t]).toFixed(4) : "0.00"}</span>
-            </button>
-          ))}
-        </div>
-      )}
-    </div>
-  );
-
   const tradeValueUsd = sellLivePrice > 0 ? amountNum * sellLivePrice : 0;
   const localExpectedOutput = livePrice > 0 && sellLivePrice > 0 ? (amountNum * sellLivePrice) / livePrice : 0;
   const displayOutput = quoteData ? quoteData.expected_output : localExpectedOutput;
@@ -280,18 +297,18 @@ export function OrderForm({ onOrderCreated }: { onOrderCreated: () => void }) {
         <div className="h-2 w-2 rounded-full bg-emerald shadow-[0_0_8px_rgba(34,220,149,0.8)] animate-pulse" />
       </div>
 
-        <PriceTicker 
-    sellToken={sellToken} 
-    buyToken={buyToken} 
-    action={action} 
-    onPriceUpdate={(newPrice) => {
-      if (action === "BUY") {
-        setLivePrice(newPrice);
-      } else {
-        setSellLivePrice(newPrice);
-      }
-    }}
-  />
+      <PriceTicker 
+        sellToken={sellToken} 
+        buyToken={buyToken} 
+        action={action} 
+        onPriceUpdate={(newPrice) => {
+          if (action === "BUY") {
+            setLivePrice(newPrice);
+          } else {
+            setSellLivePrice(newPrice);
+          }
+        }}
+      />
       
       <form onSubmit={handleSubmit} className="space-y-4 mt-4">
         
@@ -305,7 +322,15 @@ export function OrderForm({ onOrderCreated }: { onOrderCreated: () => void }) {
             </div>
             <div className="flex items-center gap-2">
               <div className="w-1/2">
-                <TokenDropdown selected={sellToken} onSelect={setSellToken} isOpen={isSellOpen} setIsOpen={setIsSellOpen} refObj={sellRef} />
+                <TokenDropdown 
+                  selected={sellToken} 
+                  onSelect={setSellToken} 
+                  isOpen={isSellOpen} 
+                  setIsOpen={setIsSellOpen} 
+                  refObj={sellRef} 
+                  availableTokens={availableTokens}
+                  balances={balances}
+                />
               </div>
               <div className="w-1/2 relative">
                 <input 
@@ -339,7 +364,15 @@ export function OrderForm({ onOrderCreated }: { onOrderCreated: () => void }) {
             </div>
             <div className="flex items-center gap-2">
               <div className="w-1/2">
-                <TokenDropdown selected={buyToken} onSelect={setBuyToken} isOpen={isBuyOpen} setIsOpen={setIsBuyOpen} refObj={buyRef} />
+                <TokenDropdown 
+                  selected={buyToken} 
+                  onSelect={setBuyToken} 
+                  isOpen={isBuyOpen} 
+                  setIsOpen={setIsBuyOpen} 
+                  refObj={buyRef}
+                  availableTokens={availableTokens}
+                  balances={balances}
+                />
               </div>
               <div className="w-1/2 relative">
                  <div className="w-full bg-onyx border border-jet-black rounded-xl p-3 text-snow font-mono text-right text-lg text-granite">
