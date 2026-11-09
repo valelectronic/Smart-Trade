@@ -74,6 +74,7 @@ class OrderCreate(BaseModel):
     direction: Literal["ABOVE", "BELOW"]
     amount: Decimal = Field(gt=0)
 
+    # --- INDENTED PROPERLY ---
     def to_database_record(self):
         sell_token = self.sell_token.upper()
         buy_token = self.buy_token.upper()
@@ -83,8 +84,12 @@ class OrderCreate(BaseModel):
 
         safe_direction = "BELOW" if self.action == "BUY" else "ABOVE"
 
-        target_token = buy_token
-        target_market = f"{target_token}-CC"
+        if self.action == "SELL":
+            monitor_token = sell_token
+        else:
+            monitor_token = buy_token
+        
+        target_market = f"{monitor_token}-CC"
         
         prices_file = Path(__file__).parent / "prices.json"
         
@@ -98,10 +103,10 @@ class OrderCreate(BaseModel):
                     trigger_price = Decimal(self.trigger_price_usd)
                     
                     if self.action == "BUY" and trigger_price > live_price:
-                        raise ValueError(f"BUY price (${trigger_price}) cannot be higher than current price of {target_token} (${live_price:.4f}).")
+                        raise ValueError(f"BUY price (${trigger_price}) cannot be higher than current price of {monitor_token} (${live_price:.4f}).")
                         
                     if self.action == "SELL" and trigger_price < live_price:
-                        raise ValueError(f"SELL price (${trigger_price}) cannot be lower than current price of {target_token} (${live_price:.4f}).")
+                        raise ValueError(f"SELL price (${trigger_price}) cannot be lower than current price of {monitor_token} (${live_price:.4f}).")
             except json.JSONDecodeError:
                 pass
 
@@ -115,11 +120,6 @@ class OrderCreate(BaseModel):
 
         route_token = None
         market = ""
-
-        if self.action == "BUY":
-            monitor_token = buy_token
-        else:
-            monitor_token = sell_token
 
         if f"{sell_token}-{buy_token}" in valid_symbols:
             market = f"{sell_token}-{buy_token}"
@@ -335,12 +335,6 @@ async def get_quote(sell: str, buy: str, amount: str):
     except Exception as e:
         return {"error": str(e), "status": "failed"}
 
-
-@app.get("/api/order-quote")
-async def get_order_quote(sell: str, buy: str, amount: str):
-    # Reuse the exact same logic as /api/quote
-    # It has the 2-second cache, so it is safe to call every 5 seconds
-    return await get_quote(sell, buy, amount)
 
 
 @app.get("/api/portfolio-value")

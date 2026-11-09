@@ -8,8 +8,15 @@ import { Button } from "./ui/Button";
 import { ChevronDown, ArrowUpDown, AlertCircle, Clock, ShieldCheck } from "lucide-react";
 import { PriceTicker } from "./priceTicker";
 
-// --- FIX 1: Memoize the TokenDropdown to prevent scroll reset ---
-const TokenDropdown = memo(({ selected, onSelect, isOpen, setIsOpen, refObj, availableTokens, balances }: { 
+const TokenDropdown = memo(({ 
+  selected, 
+  onSelect, 
+  isOpen, 
+  setIsOpen, 
+  refObj, 
+  availableTokens, 
+  balances 
+}: { 
   selected: string, 
   onSelect: (t: string) => void, 
   isOpen: boolean, 
@@ -25,7 +32,6 @@ const TokenDropdown = memo(({ selected, onSelect, isOpen, setIsOpen, refObj, ava
         onClick={() => setIsOpen(!isOpen)}
         className="w-full bg-carbon border border-jet-black rounded-xl p-3 text-snow font-mono text-xs md:text-sm flex justify-between items-center focus:ring-1 focus:ring-emerald outline-none"
       >
-        {/* Changed: Removed truncate, added break-all so it wraps to 2 lines if needed */}
         <span className="break-all text-left pr-2">
           {selected || "Select Token..."}
         </span>
@@ -41,7 +47,6 @@ const TokenDropdown = memo(({ selected, onSelect, isOpen, setIsOpen, refObj, ava
               onClick={() => { onSelect(t); setIsOpen(false); }}
               className={`w-full text-left px-4 py-3 text-sm font-mono flex items-center justify-between hover:bg-jet-black transition-colors ${selected === t ? 'text-emerald' : 'text-granite'}`}
             >
-              {/* Changed: break-all so the token name wraps instead of truncating */}
               <span className="break-all pr-2">{t}</span>
               <span className="text-xs text-granite shrink-0">{balances[t] ? parseFloat(balances[t]).toFixed(4) : "0.00"}</span>
             </button>
@@ -49,6 +54,14 @@ const TokenDropdown = memo(({ selected, onSelect, isOpen, setIsOpen, refObj, ava
         </div>
       )}
     </div>
+  );
+}, (prevProps, nextProps) => {
+  // Only re-render if the selected token, open state, or the lists change
+  return (
+    prevProps.selected === nextProps.selected &&
+    prevProps.isOpen === nextProps.isOpen &&
+    prevProps.availableTokens === nextProps.availableTokens &&
+    prevProps.balances === nextProps.balances
   );
 });
 

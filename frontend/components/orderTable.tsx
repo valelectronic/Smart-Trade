@@ -48,8 +48,8 @@ export function OrderTable({ refreshTrigger }: { refreshTrigger: number }) {
         orders.map(async (order) => {
           try {
             const res = await fetch(
-              `${process.env.NEXT_PUBLIC_API_URL}/order-quote?sell=${order.sell_token}&buy=${order.buy_token}&amount=${order.amount}`
-            );
+  `${process.env.NEXT_PUBLIC_API_URL}/quote?sell=${order.sell_token}&buy=${order.buy_token}&amount=${order.amount}`
+);
             const data = await res.json();
             if (data.status === "success") {
               return { ...order, quote: data, isFetchingQuote: false };
