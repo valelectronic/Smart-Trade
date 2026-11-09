@@ -280,7 +280,18 @@ export function OrderForm({ onOrderCreated }: { onOrderCreated: () => void }) {
         <div className="h-2 w-2 rounded-full bg-emerald shadow-[0_0_8px_rgba(34,220,149,0.8)] animate-pulse" />
       </div>
 
-      <PriceTicker sellToken={sellToken} buyToken={buyToken} action={action} />
+        <PriceTicker 
+    sellToken={sellToken} 
+    buyToken={buyToken} 
+    action={action} 
+    onPriceUpdate={(newPrice) => {
+      if (action === "BUY") {
+        setLivePrice(newPrice);
+      } else {
+        setSellLivePrice(newPrice);
+      }
+    }}
+  />
       
       <form onSubmit={handleSubmit} className="space-y-4 mt-4">
         

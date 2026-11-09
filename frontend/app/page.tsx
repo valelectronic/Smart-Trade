@@ -66,7 +66,7 @@ export default function Home() {
     fetchPortfolioValue();
     
     // Refresh every 60 seconds
-    const interval = setInterval(fetchPortfolioValue, 60000);
+    const interval = setInterval(fetchPortfolioValue, 5000);
     
     return () => {
       isCancelled = true;

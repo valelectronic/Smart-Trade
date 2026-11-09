@@ -8,11 +8,13 @@ import { Card } from "./ui/card";
 export function PriceTicker({ 
   sellToken, 
   buyToken, 
-  action 
+  action,
+    onPriceUpdate
 }: { 
   sellToken: string; 
   buyToken: string; 
   action: "BUY" | "SELL";
+   onPriceUpdate: (newPrice: number) => void;
 }) {
   const [price, setPrice] = useState<number | null>(null);
   const [prevPrice, setPrevPrice] = useState<number | null>(null);
@@ -57,6 +59,7 @@ export function PriceTicker({
             return newPrice;
           });
           setStatus("ready");
+          onPriceUpdate(newPrice); // Notify parent component of the new price
         }
       } catch (err) {}
     };
