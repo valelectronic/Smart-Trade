@@ -35,6 +35,10 @@ export function PriceTicker({
 
     const apiUrl = process.env.NEXT_PUBLIC_API_URL || "http://127.0.0.1:8000/api";
 
+        // Tell the engine to subscribe to this market
+    fetch(`${apiUrl}/subscribe?market=${targetToken}-CC`, { method: "POST" }).catch(console.error);
+    fetch(`${apiUrl}/subscribe?market=CC-${targetToken}`, { method: "POST" }).catch(console.error);
+
     // Fetch history
     fetch(`${apiUrl}/history?sell=${targetToken}&buy=CC`)
       .then(res => res.json())
