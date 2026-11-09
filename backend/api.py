@@ -177,8 +177,7 @@ def get_markets():
 
 
 @app.get("/api/price")
-async def get_price(sell: str, buy: str):
-    global _price_cache, _last_price_fetch
+def get_price(sell: str, buy: str):
     try:
         s = sell.upper()
         b = buy.upper()
@@ -188,53 +187,27 @@ async def get_price(sell: str, buy: str):
         if b in {"USDC", "USDCX"} and s in {"USD", "USDC"}:
             return {"market": f"{s}-{b}", "price": "1.0"}
         
-        cache_key = f"{s}-{b}"
-        now = time.monotonic()
-        
-        # Return cached price if less than 10 seconds old
-        if cache_key in _price_cache and now - _last_price_fetch < 10:
-            return _price_cache[cache_key]
-        
-        async with _price_lock:
-            if cache_key in _price_cache and now - _last_price_fetch < 10:
-                return _price_cache[cache_key]
-            
+        prices_file = Path(__file__).parent / "prices.json"
+        prices = {}
+        if prices_file.exists():
             try:
-                client = await connect_sdk()
-                account_admin = await client.get_account_admin()
-                instruments = {}
-                for item in getattr(account_admin, "instruments", []) or []:
-                    symbol = getattr(item, "instrument_symbol", None)
-                    instrument = getattr(item, "instrument", None)
-                    if symbol and instrument is not None:
-                        instruments[str(symbol).upper()] = instrument
-                
-                if s in instruments and b in instruments:
-                    quote = await client.get_swap_quote(
-                        sell_amount=Decimal("1"),
-                        sell_instrument=instruments[s],
-                        buy_instrument=instruments[b],
-                    )
-                    returned_obj = getattr(quote, "returned", None)
-                    if returned_obj is not None:
-                        price = float(getattr(returned_obj, "amount", 0))
-                        result = {"market": f"{s}-{b}", "price": str(price)}
-                        _price_cache[cache_key] = result
-                        _last_price_fetch = now
-                        return result
-                
-                close = getattr(client, "close", None)
-                if close:
-                    result = close()
-                    if asyncio.iscoroutine(result):
-                        await result
-            except Exception as e:
-                print(f"[PRICE SDK ERROR] {e}")
+                with prices_file.open("r") as f:
+                    prices = json.load(f)
+            except Exception:
+                pass
+
+        if b in {"USD", "USDC"}:
+            if f"{s}-USDC" in prices:
+                return {"market": f"{s}-USDC", "price": prices[f"{s}-USDC"]}
+            if f"{s}-CC" in prices:
+                return {"market": f"{s}-CC", "price": prices[f"{s}-CC"]}
+        elif b == "CC":
+            if f"{s}-CC" in prices:
+                return {"market": f"{s}-CC", "price": prices[f"{s}-CC"]}
         
         return {"error": f"No price for {s}/{b}", "price": "0"}
     except Exception as e:
         return {"error": str(e), "price": "0"}
-
 
 @app.get("/api/pool-info")
 def get_pool_info(sell: str, buy: str, action: str = "BUY"):
@@ -356,7 +329,6 @@ async def get_quote(sell: str, buy: str, amount: str):
 
 @app.get("/api/portfolio-value")
 async def get_portfolio_value():
-    global _price_cache, _last_price_fetch
     try:
         client = await connect_sdk()
         account = await client.get_account_info()
@@ -367,40 +339,24 @@ async def get_portfolio_value():
             if symbol and unlocked is not None:
                 balances[symbol.upper()] = Decimal(str(unlocked))
         
-        account_admin = await client.get_account_admin()
-        instruments = {}
-        for item in getattr(account_admin, "instruments", []) or []:
-            symbol = getattr(item, "instrument_symbol", None)
-            instrument = getattr(item, "instrument", None)
-            if symbol and instrument is not None:
-                instruments[str(symbol).upper()] = instrument
+        close = getattr(client, "close", None)
+        if close:
+            result = close()
+            if asyncio.iscoroutine(result):
+                await result
 
-        # Get CC-USDC rate (cached for 10 seconds)
-        cc_rate = Decimal("0")
-        cache_key = "CC-USDC"
-        now = time.monotonic()
+        prices_file = Path(__file__).parent / "prices.json"
+        prices = {}
+        if prices_file.exists():
+            try:
+                with prices_file.open("r") as f:
+                    prices = json.load(f)
+            except Exception:
+                pass
         
-        if cache_key in _price_cache and now - _last_price_fetch < 10:
-            cc_rate = Decimal(_price_cache[cache_key])
-        else:
-            async with _price_lock:
-                if cache_key in _price_cache and now - _last_price_fetch < 10:
-                    cc_rate = Decimal(_price_cache[cache_key])
-                else:
-                    try:
-                        if "CC" in instruments and "USDC" in instruments:
-                            quote = await client.get_swap_quote(
-                                sell_amount=Decimal("1"),
-                                sell_instrument=instruments["CC"],
-                                buy_instrument=instruments["USDC"],
-                            )
-                            returned_obj = getattr(quote, "returned", None)
-                            if returned_obj is not None:
-                                cc_rate = Decimal(str(getattr(returned_obj, "amount", 0)))
-                                _price_cache[cache_key] = str(cc_rate)
-                                _last_price_fetch = now
-                    except Exception as e:
-                        print(f"[PORTFOLIO CC RATE ERROR] {e}")
+        cc_rate = Decimal(prices.get("CC-USDC", "0"))
+        if cc_rate <= 0:
+            return {"error": "CC rate not available", "status": "failed"}
 
         total_usd = Decimal("0")
         breakdown = {}
@@ -412,34 +368,17 @@ async def get_portfolio_value():
             token_upper = token.upper()
             usd_price = Decimal("0")
 
-            if token_upper == "CC":
+            if f"{token_upper}-USDC" in prices:
+                usd_price = Decimal(prices[f"{token_upper}-USDC"])
+            elif f"{token_upper}-CC" in prices:
+                usd_price = Decimal(prices[f"{token_upper}-CC"])
+            elif token_upper == "CC":
                 usd_price = cc_rate
-            elif token_upper in {"USDC", "USDCX"}:
-                usd_price = Decimal("1")
-            elif token_upper in instruments and "CC" in instruments:
-                try:
-                    quote = await client.get_swap_quote(
-                        sell_amount=Decimal("1"),
-                        sell_instrument=instruments[token_upper],
-                        buy_instrument=instruments["CC"],
-                    )
-                    returned_obj = getattr(quote, "returned", None)
-                    if returned_obj is not None:
-                        token_in_cc = Decimal(str(getattr(returned_obj, "amount", 0)))
-                        usd_price = token_in_cc * cc_rate
-                except Exception as e:
-                    print(f"[PORTFOLIO TOKEN ERROR] {token_upper}: {e}")
 
             if usd_price > 0:
                 value = amount * usd_price
                 total_usd += value
                 breakdown[token] = str(value)
-
-        close = getattr(client, "close", None)
-        if close:
-            result = close()
-            if asyncio.iscoroutine(result):
-                await result
 
         return {
             "total_usd": str(total_usd),
