@@ -152,7 +152,16 @@ class OrderCreate(BaseModel):
 def health():
     return {"status": "ok"}
 
-
+@app.get("/api/hunter-status")
+def get_hunter_status():
+    status_file = Path(__file__).parent / "hunter_status.json"
+    if not status_file.exists():
+        return {"status": "Not running", "net_fee": 0, "pool_fee": 0}
+    try:
+        with status_file.open("r") as f:
+            return json.load(f)
+    except Exception as e:
+        return {"status": "Error reading status", "error": str(e)}
 
 @app.get("/api/markets")
 def get_markets():

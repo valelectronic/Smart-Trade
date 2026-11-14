@@ -1,7 +1,8 @@
-"""PostgreSQL storage for Cantex monitoring orders (Neon)."""
+"""PostgreSQL storage for Cantex monitoring orders and rebate swaps (Neon)."""
 
 import os
 import psycopg2
+from datetime import datetime, timezone
 from psycopg2.extras import RealDictCursor
 
 DATABASE_URL = os.getenv("DATABASE_URL")
@@ -30,9 +31,10 @@ def get_connection():
     return connection
 
 def init_db():
-    """Create the orders table if it does not already exist."""
+    """Create the orders table and rebate_swaps table if they do not already exist."""
     with get_connection() as connection:
         with connection.cursor() as cursor:
+            # 1. Your original orders table
             cursor.execute(
                 """
                 CREATE TABLE IF NOT EXISTS orders (
@@ -45,6 +47,23 @@ def init_db():
                     trigger_price_usd TEXT NOT NULL,
                     direction TEXT NOT NULL,
                     amount TEXT NOT NULL
+                )
+                """
+            )
+            # 2. The NEW rebate_swaps table
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS rebate_swaps (
+                    id SERIAL PRIMARY KEY,
+                    tx_id TEXT UNIQUE NOT NULL,
+                    pair TEXT NOT NULL,
+                    sell_token TEXT NOT NULL,
+                    buy_token TEXT NOT NULL,
+                    sell_amount TEXT NOT NULL,
+                    network_fee TEXT NOT NULL,
+                    pool_fee TEXT NOT NULL,
+                    usd_value TEXT NOT NULL,
+                    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
                 )
                 """
             )
@@ -113,3 +132,42 @@ def delete_order(order_id):
         connection.commit()
 
     return rowcount > 0
+
+# ==========================================
+# NEW FUNCTIONS FOR REBATE HUNTER
+# ==========================================
+
+def get_today_swap_count():
+    """Returns the number of successful swaps executed today."""
+    with get_connection() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT COUNT(*) as count 
+                FROM rebate_swaps 
+                WHERE created_at >= CURRENT_DATE
+                """
+            )
+            row = cursor.fetchone()
+            
+    return row["count"] if row else 0
+
+def log_successful_swap(tx_id, pair, sell_token, buy_token, sell_amount, net_fee, pool_fee, usd_value):
+    """Logs a successful swap to the database."""
+    with get_connection() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                INSERT INTO rebate_swaps (
+                    tx_id, pair, sell_token, buy_token, 
+                    sell_amount, network_fee, pool_fee, usd_value
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (tx_id) DO NOTHING
+                """,
+                (
+                    str(tx_id), str(pair), str(sell_token), str(buy_token),
+                    str(sell_amount), str(net_fee), str(pool_fee), str(usd_value)
+                ),
+            )
+        connection.commit()

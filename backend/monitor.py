@@ -36,10 +36,13 @@ BTC_MARKET_SYMBOL = "BTC-USDC"
 ETH_MARKET_SYMBOL = "ETH-USDC"
 COOLDOWN_SECONDS = float(getattr(config, "COOLDOWN_SECONDS", 60))
 
-ORDER_REFRESH_SECONDS = 5
+# --- DB FETCH SETTINGS ---
+DB_REFRESH_SECONDS = 300  # 5 minutes (prevents Neon DB from staying awake)
+ORDER_REFRESH_SECONDS = 5 # Kept for backwards compatibility, not used for DB
+
 INITIAL_RECONNECT_SECONDS = 2
 MAX_RECONNECT_SECONDS = 30
-PRINT_COOLDOWN_SECONDS = 5  # NEW: Only print to terminal every 5 seconds per market
+PRINT_COOLDOWN_SECONDS = 5  # Only print to terminal every 5 seconds per market
 
 PRICES_FILE = ROOT / "prices.json"
 
@@ -157,7 +160,7 @@ def ticker_price_from_message(message):
 
 
 async def run_monitor():
-    init_db()
+    # init_db() # <-- RECOMMENDED: Comment this out once you are sure your DB tables exist. It prevents a DB wake-up on every restart.
 
     telegram = None
     telegram_task = None
@@ -192,28 +195,35 @@ async def run_monitor():
         market_channels = {}
         reconnect_delay = INITIAL_RECONNECT_SECONDS
         
-        # NEW: Track when we last printed to prevent terminal spam
+        # Track when we last printed to prevent terminal spam
         last_print_time = {}
+        
+        # Track when we last fetched from DB (Start at 0 to force a fetch on startup)
+        last_db_fetch_time = 0
 
         print("[SAFETY] Quote-only mode. No swap-submission method is called.")
 
         while True:
-            orders = await asyncio.to_thread(get_all_orders)
-            signature = order_signature(orders)
+            # Initial fetch on startup, or forced refresh from the API
+            if last_db_fetch_time == 0:
+                orders = await asyncio.to_thread(get_all_orders)
+                signature = order_signature(orders)
 
-            if signature != active_signature:
-                print(f"[ORDERS] Database contains {len(orders)} order(s).")
-                market_channels = await discover_order_channels(orders)
-                active_orders = [order for order in orders if order["market"] in market_channels]
-                for order in active_orders:
-                    if order["id"] not in armed:
-                        armed[order["id"]] = True
-                        # Start the cooldown timer from NOW, not 0.0
-                        last_trigger[order["id"]] = time.monotonic()
-                active_ids = {order["id"] for order in active_orders}
-                armed = {order_id: value for order_id, value in armed.items() if order_id in active_ids}
-                last_trigger = {order_id: value for order_id, value in last_trigger.items() if order_id in active_ids}
-                active_signature = signature
+                if signature != active_signature:
+                    print(f"[ORDERS] Database contains {len(orders)} order(s).")
+                    market_channels = await discover_order_channels(orders)
+                    active_orders = [order for order in orders if order["market"] in market_channels]
+                    for order in active_orders:
+                        if order["id"] not in armed:
+                            armed[order["id"]] = True
+                            last_trigger[order["id"]] = time.monotonic()
+                    active_ids = {order["id"] for order in active_orders}
+                    armed = {order_id: value for order_id, value in armed.items() if order_id in active_ids}
+                    last_trigger = {order_id: value for order_id, value in last_trigger.items() if order_id in active_ids}
+                    active_signature = signature
+                
+                # Set the timer so we don't fetch again for 5 minutes
+                last_db_fetch_time = time.monotonic()
 
             subscribed_channels = sorted(set(market_channels.values()) | {rate_channel, btc_channel, eth_channel})
             print(f"[WS] Connecting to {WS_URL}")
@@ -224,14 +234,14 @@ async def run_monitor():
                     print(f"[WS] Connected and subscribed: {', '.join(subscribed_channels)}")
                     log_event("WS_CONNECTED", details=f"channels={','.join(subscribed_channels)}")
                     reconnect_delay = INITIAL_RECONNECT_SECONDS
-                    next_order_refresh = time.monotonic() + ORDER_REFRESH_SECONDS
 
                     while True:
+                        # 1. Check for UI "refresh" signals (e.g., new order created)
                         try:
                             new_market = subscription_queue.get_nowait()
                             if new_market == "refresh":
-                                # Force an immediate order refresh
-                                next_order_refresh = time.monotonic()
+                                print("[DB] Refresh signal received from API.")
+                                last_db_fetch_time = 0 # Forces a fetch at the top of the loop
                                 continue
                             if new_market not in market_channels:
                                 try:
@@ -248,9 +258,11 @@ async def run_monitor():
                         except asyncio.QueueEmpty:
                             pass
 
-                        if time.monotonic() >= next_order_refresh:
+                        # 2. Background DB check every 5 minutes (300s)
+                        if time.monotonic() - last_db_fetch_time >= DB_REFRESH_SECONDS:
                             latest_orders = await asyncio.to_thread(get_all_orders)
                             latest_signature = order_signature(latest_orders)
+                            
                             if latest_signature != active_signature:
                                 active_signature = latest_signature
                                 market_channels = await discover_order_channels(latest_orders)
@@ -265,7 +277,8 @@ async def run_monitor():
                                 subscribed_channels = sorted(set(market_channels.values()) | {rate_channel, btc_channel, eth_channel})
                                 await ws.send(json.dumps({"op": "subscribe", "channels": subscribed_channels, "limit": 500}))
                                 print(f"[ORDERS] Updated subscriptions: {', '.join(subscribed_channels)}")
-                            next_order_refresh = time.monotonic() + ORDER_REFRESH_SECONDS
+                            
+                            last_db_fetch_time = time.monotonic() # Reset the 5-minute timer
 
                         try:
                             raw = await asyncio.wait_for(ws.recv(), timeout=2)
