@@ -31,10 +31,10 @@ def get_connection():
     return connection
 
 def init_db():
-    """Create the orders table and rebate_swaps table if they do not already exist."""
+    """Create all tables if they do not already exist."""
     with get_connection() as connection:
         with connection.cursor() as cursor:
-            # 1. Your original orders table
+            # 1. Orders table
             cursor.execute(
                 """
                 CREATE TABLE IF NOT EXISTS orders (
@@ -50,7 +50,7 @@ def init_db():
                 )
                 """
             )
-            # 2. The NEW rebate_swaps table
+            # 2. Rebate Swaps table
             cursor.execute(
                 """
                 CREATE TABLE IF NOT EXISTS rebate_swaps (
@@ -63,6 +63,20 @@ def init_db():
                     network_fee TEXT NOT NULL,
                     pool_fee TEXT NOT NULL,
                     usd_value TEXT NOT NULL,
+                    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+                )
+                """
+            )
+            # 3. Hunter Rules table
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS hunter_rules (
+                    id SERIAL PRIMARY KEY,
+                    token_a TEXT NOT NULL,
+                    token_b TEXT NOT NULL,
+                    net_min TEXT NOT NULL,
+                    net_max TEXT NOT NULL,
+                    is_active BOOLEAN DEFAULT TRUE,
                     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
                 )
                 """
@@ -134,7 +148,7 @@ def delete_order(order_id):
     return rowcount > 0
 
 # ==========================================
-# NEW FUNCTIONS FOR REBATE HUNTER
+# REBATE HUNTER FUNCTIONS
 # ==========================================
 
 def get_today_swap_count():
@@ -171,3 +185,35 @@ def log_successful_swap(tx_id, pair, sell_token, buy_token, sell_amount, net_fee
                 ),
             )
         connection.commit()
+
+def get_today_fees_spent():
+    """Returns the total network fees spent today in CC."""
+    with get_connection() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT COALESCE(SUM(CAST(network_fee AS DECIMAL)), 0) as total_fees
+                FROM rebate_swaps 
+                WHERE created_at >= CURRENT_DATE
+                """
+            )
+            row = cursor.fetchone()
+    return float(row["total_fees"]) if row else 0.0
+
+def delete_hunter_rule(rule_id: int):
+    """Delete a hunter rule by ID."""
+    with get_connection() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute("DELETE FROM hunter_rules WHERE id = %s", (rule_id,))
+            rowcount = cursor.rowcount
+        connection.commit()
+    return rowcount > 0
+
+def get_active_hunter_rules():
+    """Returns a list of active hunter rules (tokens only)."""
+    with get_connection() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT token_a, token_b FROM hunter_rules WHERE is_active = TRUE"
+            )
+            return cursor.fetchall()

@@ -3,13 +3,13 @@
 import { useState, useEffect } from "react";
 import { OrderForm } from "@/components/orderForm";
 import { OrderTable } from "@/components/orderTable";
+import { HunterDashboard } from "@/components/HunterDashboard"; // <-- NEW IMPORT
 import { MarketBar } from "@/components/marketBar"; 
-import { getBalances, getLivePrice } from "@/lib/api";
-import { Wallet, Activity, Bell, PlusCircle, List, TrendingUp } from "lucide-react";
+import { Wallet, Activity, Bell, PlusCircle, List, TrendingUp, Crosshair } from "lucide-react"; // <-- Added Crosshair
 
 export default function Home() {
   const [refreshTrigger, setRefreshTrigger] = useState(0);
-  const [activeTab, setActiveTab] = useState<"create" | "orders">("create");
+  const [activeTab, setActiveTab] = useState<"create" | "orders" | "hunter">("create");
   const [isMounted, setIsMounted] = useState(false);
   
   // Portfolio Value State
@@ -19,7 +19,7 @@ export default function Home() {
   // Load saved tab safely after mounting
   useEffect(() => {
     const saved = localStorage.getItem("cantex_activeTab");
-    if (saved === "create" || saved === "orders") {
+    if (saved === "create" || saved === "orders" || saved === "hunter") {
       setActiveTab(saved);
     }
     setIsMounted(true);
@@ -41,19 +41,20 @@ export default function Home() {
       
       const timeoutId = setTimeout(() => {
         if (!isCancelled) setIsFetchingValue(false);
-      }, 8000); // Increased timeout for slow SDK calls
+      }, 8000); 
 
       try {
         const res = await fetch(`${process.env.NEXT_PUBLIC_API_URL}/portfolio-value`);
         const data = await res.json();
         
-        if (data.status === "success" && data.total_usd && !isCancelled) {
+                if (data.status === "success" && data.total_usd && !isCancelled) {
           const parsedValue = parseFloat(data.total_usd);
           if (!isNaN(parsedValue)) {
             setTotalPortfolioValue(parsedValue);
           }
         } else {
-          console.error("Portfolio error:", data.error || "Unknown error");
+          // Silently ignore background errors so we don't spam the console
+          // The next poll in 5 seconds will likely succeed
         }
       } catch (err) {
         console.error("Failed to fetch portfolio value", err);
@@ -65,8 +66,7 @@ export default function Home() {
     
     fetchPortfolioValue();
     
-    // Refresh every 60 seconds
-    const interval = setInterval(fetchPortfolioValue, 5000);
+    const interval = setInterval(fetchPortfolioValue, 60000);
     
     return () => {
       isCancelled = true;
@@ -138,25 +138,35 @@ export default function Home() {
             <p className="text-granite text-sm">Manage your semi-automated strategies.</p>
           </div>
 
-          {/* Tab Switcher */}
-          <div className="flex bg-carbon p-1 rounded-xl border border-jet-black w-full md:w-auto">
+          {/* Tab Switcher - Desktop & Mobile (Scrollable if needed) */}
+          <div className="flex bg-carbon p-1 rounded-xl border border-jet-black w-full md:w-auto overflow-x-auto no-scrollbar">
             <button
               onClick={() => setActiveTab("create")}
-              className={`flex-1 md:flex-none flex items-center justify-center gap-2 px-6 py-2 text-sm font-medium rounded-lg transition-all ${
+              className={`flex-1 md:flex-none flex items-center justify-center gap-2 px-4 md:px-6 py-2 text-xs md:text-sm font-medium rounded-lg transition-all whitespace-nowrap ${
                 activeTab === "create" ? "bg-jet-black text-emerald shadow-sm" : "text-granite hover:text-snow"
               }`}
             >
               <PlusCircle size={16} />
-              Create Trade
+              Create
             </button>
             <button
               onClick={() => setActiveTab("orders")}
-              className={`flex-1 md:flex-none flex items-center justify-center gap-2 px-6 py-2 text-sm font-medium rounded-lg transition-all ${
+              className={`flex-1 md:flex-none flex items-center justify-center gap-2 px-4 md:px-6 py-2 text-xs md:text-sm font-medium rounded-lg transition-all whitespace-nowrap ${
                 activeTab === "orders" ? "bg-jet-black text-emerald shadow-sm" : "text-granite hover:text-snow"
               }`}
             >
               <List size={16} />
-              Active Orders
+              Orders
+            </button>
+            {/* NEW HUNTER TAB */}
+            <button
+              onClick={() => setActiveTab("hunter")}
+              className={`flex-1 md:flex-none flex items-center justify-center gap-2 px-4 md:px-6 py-2 text-xs md:text-sm font-medium rounded-lg transition-all whitespace-nowrap ${
+                activeTab === "hunter" ? "bg-jet-black text-emerald shadow-sm" : "text-granite hover:text-snow"
+              }`}
+            >
+              <Crosshair size={16} />
+              Hunter
             </button>
           </div>
         </div>
@@ -172,6 +182,13 @@ export default function Home() {
           {activeTab === "orders" && (
             <div className="w-full animate-in fade-in slide-in-from-bottom-2 duration-300">
               <OrderTable refreshTrigger={refreshTrigger} />
+            </div>
+          )}
+
+          {/* NEW HUNTER CONTENT */}
+          {activeTab === "hunter" && (
+            <div className="w-full animate-in fade-in slide-in-from-bottom-2 duration-300">
+              <HunterDashboard />
             </div>
           )}
         </div>
@@ -193,6 +210,14 @@ export default function Home() {
         >
           <List size={20} />
           <span className="text-[10px] mt-1 font-medium">Orders</span>
+        </div>
+        {/* NEW HUNTER ICON */}
+        <div 
+          onClick={() => setActiveTab("hunter")}
+          className={`flex flex-col items-center cursor-pointer transition-colors ${activeTab === "hunter" ? "text-emerald" : "text-granite"}`}
+        >
+          <Crosshair size={20} />
+          <span className="text-[10px] mt-1 font-medium">Hunter</span>
         </div>
         <div className="flex flex-col items-center text-granite hover:text-snow cursor-pointer transition-colors">
           <Wallet size={20} />

@@ -64,7 +64,7 @@ export function OrderTable({ refreshTrigger }: { refreshTrigger: number }) {
     };
 
     fetchAllQuotes();
-    const interval = setInterval(fetchAllQuotes, 5000);
+    const interval = setInterval(fetchAllQuotes, 15000);//fetch quotes every 15 seconds
     return () => clearInterval(interval);
   }, [orders.length]);
 

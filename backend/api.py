@@ -20,6 +20,7 @@ from cantex_api import connect_sdk
 from helpers import get_token_balance
 
 from postgres_database import add_order, delete_order, get_all_orders, init_db
+from postgres_database import get_connection, get_today_fees_spent, delete_hunter_rule
 from config import PUBLIC_BASE
 
 # --- Price Cache ---
@@ -387,13 +388,20 @@ async def get_portfolio_value():
             token_upper = token.upper()
             usd_price = Decimal("0")
 
+            # 1. If we have the direct USD price, use it
             if f"{token_upper}-USDC" in prices:
                 usd_price = Decimal(prices[f"{token_upper}-USDC"])
+                
+            # 2. If we only have the raw CC price, multiply it by CC-USDC
             elif f"{token_upper}-CC" in prices:
-                usd_price = Decimal(prices[f"{token_upper}-CC"])
+                token_cc_price = Decimal(prices[f"{token_upper}-CC"])
+                usd_price = token_cc_price * cc_rate
+                
+            # 3. Special case for CC itself
             elif token_upper == "CC":
                 usd_price = cc_rate
 
+            # 4. Calculate and add to total
             if usd_price > 0:
                 value = amount * usd_price
                 total_usd += value
@@ -532,6 +540,87 @@ def get_history(sell: str, buy: str):
         return []
 
 
+from pydantic import BaseModel
+from postgres_database import get_connection
+
+class HunterRuleCreate(BaseModel):
+    token_a: str
+    token_b: str
+    net_min: str
+    net_max: str
+
+@app.post("/api/hunter-rules")
+def save_hunter_rule(rule: HunterRuleCreate):
+    try:
+        with get_connection() as conn:
+            with conn.cursor() as cur:
+                # Deactivate old rules for the same pair
+                cur.execute(
+                    "UPDATE hunter_rules SET is_active = FALSE WHERE token_a = %s AND token_b = %s",
+                    (rule.token_a.upper(), rule.token_b.upper())
+                )
+                # Insert new rule
+                cur.execute(
+                    "INSERT INTO hunter_rules (token_a, token_b, net_min, net_max) VALUES (%s, %s, %s, %s)",
+                    (rule.token_a.upper(), rule.token_b.upper(), rule.net_min, rule.net_max)
+                )
+            conn.commit()
+        return {"status": "success", "message": "Rule saved"}
+    except Exception as e:
+        print(f"[DB ERROR] Failed to save rule: {e}") # <-- THIS WILL SHOW IN YOUR TERMINAL
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/hunter-rules")
+def get_hunter_rules():
+    try:
+        with get_connection() as conn:
+            with conn.cursor() as cur:
+                # FIX: Added 'id' to the SELECT
+                cur.execute("SELECT id, token_a, token_b, net_min, net_max FROM hunter_rules WHERE is_active = TRUE")
+                rows = cur.fetchall()
+        return [dict(row) for row in rows]
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.delete("/api/hunter-rules/{rule_id}", status_code=status.HTTP_204_NO_CONTENT)
+def remove_hunter_rule(rule_id: int):
+    try:
+        # DELETE only needs the rule_id passed from the URL, no SELECT needed here
+        deleted = delete_hunter_rule(rule_id)
+        if not deleted:
+            raise HTTPException(status_code=404, detail="Rule not found")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+@app.get("/api/hunter-fees")
+def get_fees_spent():
+    try:
+        total = get_today_fees_spent()
+        return {"total_fees_cc": total, "status": "success"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/hunter-history")
+def get_hunter_history():
+    try:
+        with get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT tx_id, pair, sell_token, buy_token, sell_amount, network_fee, pool_fee, usd_value, created_at 
+                    FROM rebate_swaps 
+                    ORDER BY created_at DESC 
+                    LIMIT 20
+                    """
+                )
+                rows = cur.fetchall()
+        return [dict(row) for row in rows]
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+
 @app.delete("/api/orders/{order_id}", status_code=status.HTTP_204_NO_CONTENT)
 def remove_order(order_id: str):
     try:
@@ -549,3 +638,10 @@ def remove_order(order_id: str):
         )
 
     return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+# ==========================================
+# ADD THIS AT THE VERY BOTTOM
+# ==========================================
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)

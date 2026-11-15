@@ -1,30 +1,19 @@
 """Cantex Version 1.5 monitoring engine."""
-
 import asyncio
 import json
 import os
 import time
 from decimal import Decimal
 from pathlib import Path
-
 import websockets
 from dotenv import load_dotenv
-
 from cantex_api import connect_sdk, discover_market
-# --- CHANGED: Points to new Postgres file ---
-from postgres_database import get_all_orders, init_db
-from helpers import (
-    dec,
-    get_cc_balance,
-    get_token_balance,
-    log_csv,
-    now_iso,
-)
+from postgres_database import get_all_orders, init_db, get_active_hunter_rules  # <-- NEW IMPORT
+from helpers import dec, get_cc_balance, log_csv, now_iso
 from preflight import quote_and_preflight
 from rate_manager import LiveCCUsdRate
 from telegram_alerts import TelegramAlerts
 from api import broadcast_price, subscription_queue
-
 import config
 
 ROOT = Path(__file__).resolve().parent
@@ -36,36 +25,32 @@ BTC_MARKET_SYMBOL = "BTC-USDC"
 ETH_MARKET_SYMBOL = "ETH-USDC"
 COOLDOWN_SECONDS = float(getattr(config, "COOLDOWN_SECONDS", 60))
 
-# --- DB FETCH SETTINGS ---
-DB_REFRESH_SECONDS = 300  # 5 minutes (prevents Neon DB from staying awake)
-ORDER_REFRESH_SECONDS = 5 # Kept for backwards compatibility, not used for DB
-
+DB_REFRESH_SECONDS = 1800  # 30 minutes
 INITIAL_RECONNECT_SECONDS = 2
 MAX_RECONNECT_SECONDS = 30
-PRINT_COOLDOWN_SECONDS = 5  # Only print to terminal every 5 seconds per market
+PRINT_COOLDOWN_SECONDS = 5
 
 PRICES_FILE = ROOT / "prices.json"
 
-
-def save_live_price(market, usd_price):
-    """Save the latest USD price to a file and broadcast to WebSocket clients."""
+def save_live_price(market, price_value):
+    """Save the latest price to a file and broadcast to WebSocket clients."""
     try:
         prices = {}
         if PRICES_FILE.exists():
             with PRICES_FILE.open("r") as f:
                 prices = json.load(f)
         
-        prices[market] = str(usd_price)
+        prices[market] = str(price_value)
         
-        with PRICES_FILE.open("w") as f:
+        # ATOMIC WRITE: Write to temp file, then replace
+        tmp_file = PRICES_FILE.with_suffix(".tmp")
+        with tmp_file.open("w") as f:
             json.dump(prices, f)
+        tmp_file.replace(PRICES_FILE)
             
-        # Broadcast to connected WebSocket clients (INSTANT, NO COOLDOWN)
-        asyncio.create_task(broadcast_price(market, float(usd_price)))
-            
+        asyncio.create_task(broadcast_price(market, float(price_value)))
     except Exception as e:
         print(f"[PRICE SAVE ERROR] {e}")
-
 
 def log_event(event, order=None, **values):
     payload = {}
@@ -82,14 +67,12 @@ def log_event(event, order=None, **values):
     payload.update(values)
     log_csv(event, **payload)
 
-
 def order_signature(orders):
     return tuple(sorted((
         str(order["id"]), str(order["market"]), str(order["action"]),
         str(order["sell_token"]), str(order["buy_token"]),
         str(order["trigger_price_usd"]), str(order["direction"]), str(order["amount"])
     ) for order in orders))
-
 
 async def load_all_instruments(client):
     admin = await client.get_account_admin()
@@ -101,7 +84,6 @@ async def load_all_instruments(client):
             instruments[str(symbol).upper()] = instrument
     return instruments
 
-
 async def discover_order_channels(orders):
     market_channels = {}
     for order in orders:
@@ -111,12 +93,29 @@ async def discover_order_channels(orders):
         try:
             metadata, channel = await asyncio.to_thread(discover_market, symbol)
             market_channels[symbol] = channel
-            print(f"[MARKET] Verified: {metadata.get('symbol')}; ticker={channel}")
         except Exception as exc:
             print(f"[MARKET ERROR] Order {order['id']}: could not discover {symbol}: {exc}")
-            log_event("MARKET_DISCOVERY_FAILED", order, details=f"{type(exc).__name__}: {exc}")
     return market_channels
 
+# --- NEW: Fetch Hunter Tokens from DB ---
+async def discover_hunter_channels():
+    market_channels = {}
+    try:
+        rules = await asyncio.to_thread(get_active_hunter_rules)
+        for rule in rules:
+            for token in [rule["token_a"], rule["token_b"]]:
+                symbol = f"{token}-CC"
+                if symbol not in market_channels:
+                    try:
+                        metadata, channel = await asyncio.to_thread(discover_market, symbol)
+                        market_channels[symbol] = channel
+                        print(f"[HUNTER] Verified: {symbol}; ticker={channel}")
+                    except Exception as e:
+                        print(f"[HUNTER ERROR] Could not discover {symbol}: {e}")
+    except Exception as e:
+        print(f"[HUNTER FETCH ERROR] {e}")
+    return market_channels
+# ----------------------------------------
 
 def usd_price_from_ticker(market_symbol, ticker_price, cc_usd_rate):
     symbol = str(market_symbol).upper()
@@ -128,24 +127,18 @@ def usd_price_from_ticker(market_symbol, ticker_price, cc_usd_rate):
         return price
         
     if symbol.endswith("-CC"):
-        # 1. Try the live WebSocket rate first
         if cc_usd_rate is not None and cc_usd_rate > 0:
             return price * cc_usd_rate
-            
-        # 2. FALLBACK: If the live rate is missing, read the saved rate from prices.json
         try:
             if PRICES_FILE.exists():
                 with PRICES_FILE.open("r") as f:
                     prices = json.load(f)
-                
                 rate_from_file = prices.get("CC-USDC")
                 if rate_from_file:
                     return price * dec(rate_from_file)
-        except Exception as e:
-            print(f"[PRICE FALLBACK ERROR] {e}")
-            
+        except Exception:
+            pass
         return None
-        
     return None
 
 def ticker_price_from_message(message):
@@ -158,10 +151,7 @@ def ticker_price_from_message(message):
             return value
     return None
 
-
 async def run_monitor():
-    # init_db() # <-- RECOMMENDED: Comment this out once you are sure your DB tables exist. It prevents a DB wake-up on every restart.
-
     telegram = None
     telegram_task = None
     client = None
@@ -194,11 +184,7 @@ async def run_monitor():
         active_signature = None
         market_channels = {}
         reconnect_delay = INITIAL_RECONNECT_SECONDS
-        
-        # Track when we last printed to prevent terminal spam
         last_print_time = {}
-        
-        # Track when we last fetched from DB (Start at 0 to force a fetch on startup)
         last_db_fetch_time = 0
 
         print("[SAFETY] Quote-only mode. No swap-submission method is called.")
@@ -221,8 +207,11 @@ async def run_monitor():
                     armed = {order_id: value for order_id, value in armed.items() if order_id in active_ids}
                     last_trigger = {order_id: value for order_id, value in last_trigger.items() if order_id in active_ids}
                     active_signature = signature
+
+                # Fetch Hunter Tokens on startup
+                hunter_channels = await discover_hunter_channels()
+                market_channels.update(hunter_channels)
                 
-                # Set the timer so we don't fetch again for 5 minutes
                 last_db_fetch_time = time.monotonic()
 
             subscribed_channels = sorted(set(market_channels.values()) | {rate_channel, btc_channel, eth_channel})
@@ -232,33 +221,28 @@ async def run_monitor():
                 async with websockets.connect(WS_URL, ping_interval=20, ping_timeout=20, close_timeout=5, max_size=5_000_000) as ws:
                     await ws.send(json.dumps({"op": "subscribe", "channels": subscribed_channels, "limit": 500}))
                     print(f"[WS] Connected and subscribed: {', '.join(subscribed_channels)}")
-                    log_event("WS_CONNECTED", details=f"channels={','.join(subscribed_channels)}")
                     reconnect_delay = INITIAL_RECONNECT_SECONDS
 
                     while True:
-                        # 1. Check for UI "refresh" signals (e.g., new order created)
                         try:
                             new_market = subscription_queue.get_nowait()
                             if new_market == "refresh":
                                 print("[DB] Refresh signal received from API.")
-                                last_db_fetch_time = 0 # Forces a fetch at the top of the loop
+                                last_db_fetch_time = 0
                                 continue
                             if new_market not in market_channels:
                                 try:
                                     _, channel = await asyncio.to_thread(discover_market, new_market)
                                     market_channels[new_market] = channel
                                     subscribed_channels = sorted(set(market_channels.values()) | {rate_channel, btc_channel, eth_channel})
-                                    await ws.send(json.dumps({
-                                        "op": "subscribe",
-                                        "channels": [channel],
-                                    }))
+                                    await ws.send(json.dumps({"op": "subscribe", "channels": [channel]}))
                                     print(f"[DYNAMIC] Subscribed to {new_market}")
                                 except Exception as e:
                                     print(f"[DYNAMIC ERROR] Failed to subscribe to {new_market}: {e}")
                         except asyncio.QueueEmpty:
                             pass
 
-                        # 2. Background DB check every 5 minutes (300s)
+                        # 2. Background DB check every 30 minutes (1800s)
                         if time.monotonic() - last_db_fetch_time >= DB_REFRESH_SECONDS:
                             latest_orders = await asyncio.to_thread(get_all_orders)
                             latest_signature = order_signature(latest_orders)
@@ -274,11 +258,17 @@ async def run_monitor():
                                 active_ids = {order["id"] for order in active_orders}
                                 armed = {key: value for key, value in armed.items() if key in active_ids}
                                 last_trigger = {key: value for key, value in last_trigger.items() if key in active_ids}
-                                subscribed_channels = sorted(set(market_channels.values()) | {rate_channel, btc_channel, eth_channel})
-                                await ws.send(json.dumps({"op": "subscribe", "channels": subscribed_channels, "limit": 500}))
-                                print(f"[ORDERS] Updated subscriptions: {', '.join(subscribed_channels)}")
+
+                            # --- NEW: Refresh Hunter Tokens every 30 mins ---
+                            hunter_channels = await discover_hunter_channels()
+                            market_channels.update(hunter_channels)
+                            # ------------------------------------------------
                             
-                            last_db_fetch_time = time.monotonic() # Reset the 5-minute timer
+                            # Re-subscribe to the new union set
+                            subscribed_channels = sorted(set(market_channels.values()) | {rate_channel, btc_channel, eth_channel})
+                            await ws.send(json.dumps({"op": "subscribe", "channels": subscribed_channels, "limit": 500}))
+                            print(f"[ORDERS] Updated subscriptions: {', '.join(subscribed_channels)}")
+                            last_db_fetch_time = time.monotonic()
 
                         try:
                             raw = await asyncio.wait_for(ws.recv(), timeout=2)
@@ -309,19 +299,9 @@ async def run_monitor():
                         if channel == rate_channel:
                             rate_value = ticker_price_from_message(message)
                             if rate_value is None:
-                                log_event("WS_BAD_RATE", details=f"data={data}")
                                 continue
                             rate_source.update(rate_value)
                             save_live_price(RATE_MARKET_SYMBOL, rate_value)
-                            
-                            # Print rate every 5 seconds to prevent spam
-                            now = time.monotonic()
-                            if now - last_print_time.get(RATE_MARKET_SYMBOL, 0) >= PRINT_COOLDOWN_SECONDS:
-                                print(f"[RATE] {RATE_MARKET_SYMBOL} updated: {rate_value} USDC per CC")
-                                last_print_time[RATE_MARKET_SYMBOL] = now
-                                
-                            # Broadcast instantly to UI
-                            asyncio.create_task(broadcast_price(RATE_MARKET_SYMBOL, float(rate_value)))
                             continue
 
                         if channel == btc_channel:
@@ -344,7 +324,6 @@ async def run_monitor():
 
                         price = ticker_price_from_message(message)
                         if price is None:
-                            log_event("WS_BAD_PRICE", details=f"channel={channel}; data={data}")
                             continue
 
                         cc_usd_rate = rate_source.get_rate(warn_if_stale=True)
@@ -352,19 +331,16 @@ async def run_monitor():
                         stamp = now_iso()
 
                         if usd_price is None:
-                            log_event("USD_PRICE_UNAVAILABLE", market=market_symbol, price=price, cc_usd_rate=cc_usd_rate)
                             continue
 
-                        # 1. Save & Broadcast INSTANTLY (No Cooldown)
-                        save_live_price(market_symbol, usd_price)
+                        save_live_price(market_symbol, price)
+                        usd_market_symbol = market_symbol.replace("-CC", "-USD")
+                        save_live_price(usd_market_symbol, usd_price)
                         
-                        # 2. Print to terminal every 5 seconds (Spam Control)
                         now = time.monotonic()
                         if now - last_print_time.get(market_symbol, 0) >= PRINT_COOLDOWN_SECONDS:
-                            print(f"[{stamp}] {market_symbol}: ticker={price}; USD-equivalent={usd_price}")
+                            print(f"[{stamp}] {market_symbol}: ticker={price}; USD={usd_price}")
                             last_print_time[market_symbol] = now
-
-                        log_event("PRICE", market=market_symbol, price=price, usd_price=usd_price, cc_usd_rate=cc_usd_rate)
 
                         for order in active_orders:
                             if order["market"] != market_symbol:
@@ -374,10 +350,8 @@ async def run_monitor():
                             direction = str(order["direction"]).upper()
 
                             if target is None or target <= 0:
-                                log_event("INVALID_ORDER_TRIGGER", order, details="Trigger price is invalid")
                                 continue
                             if direction not in {"ABOVE", "BELOW"}:
-                                log_event("INVALID_ORDER_DIRECTION", order, details=f"direction={direction}")
                                 continue
 
                             condition_met = (usd_price >= target if direction == "ABOVE" else usd_price <= target)
@@ -390,8 +364,6 @@ async def run_monitor():
                             if condition_met and armed.get(order_id, True) and cooldown_finished:
                                 armed[order_id] = False
                                 last_trigger[order_id] = time.monotonic()
-                                print(f"[TRIGGER] {order_id}: {direction} ${target}; observed=${usd_price}")
-                                log_event("TRIGGER", order, price=price, usd_price=usd_price, cc_usd_rate=cc_usd_rate, details=f"trigger_timestamp={stamp}")
                                 await quote_and_preflight(client=client, instruments=instruments, order=order, price=price, usd_price=usd_price, cc_usd_rate=cc_usd_rate, trigger_time=stamp, telegram=telegram)
 
             except asyncio.CancelledError:
@@ -399,7 +371,6 @@ async def run_monitor():
             except Exception as exc:
                 message = f"{type(exc).__name__}: {exc}"
                 print(f"[WS ERROR] {message}; reconnecting in {reconnect_delay}s")
-                log_event("WS_DISCONNECTED", details=message)
                 await asyncio.sleep(reconnect_delay)
                 reconnect_delay = min(reconnect_delay * 2, MAX_RECONNECT_SECONDS)
 
