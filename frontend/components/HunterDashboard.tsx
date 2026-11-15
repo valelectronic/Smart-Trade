@@ -50,7 +50,7 @@ export function HunterDashboard() {
   const aRef = useRef<HTMLDivElement>(null);
   const bRef = useRef<HTMLDivElement>(null);
 
-  const apiUrl = process.env.NEXT_PUBLIC_API_URL || "http://127.0.0.1:8000";
+  const apiUrl = "https://smart-trade-production-44e4.up.railway.app";
 
   useEffect(() => {
     getBalances().then((data) => {
