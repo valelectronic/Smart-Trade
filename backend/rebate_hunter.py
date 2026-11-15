@@ -10,9 +10,9 @@ from helpers import get_cc_balance
 from postgres_database import get_today_swap_count, log_successful_swap
 
 # --- CONFIGURATION ---
-TARGET_SWAP_SIZE_CC = Decimal("100.5")
+TARGET_SWAP_SIZE_CC = Decimal("101")
 POOL_MIN = Decimal("0.10")
-POOL_MAX = Decimal("0.15")
+POOL_MAX = Decimal("0.17")
 DAILY_LIMIT = 25
 POST_SWAP_COOLDOWN = 15  
 RED_LIGHT_WAIT = 10      
