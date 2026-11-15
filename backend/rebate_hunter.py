@@ -4,6 +4,13 @@ import time
 import httpx
 from decimal import Decimal
 import os
+
+def canonical_pair_key(token_a: str, token_b: str) -> str:
+    """Sort so MOD::TRKXDEFI and TRKXDEFI::MOD share the same key."""
+    a, b = sorted([token_a, token_b])
+    return f"{a}::{b}"
+
+
 from pathlib import Path
 from cantex_api import connect_sdk
 from helpers import get_cc_balance
@@ -189,9 +196,10 @@ async def check_and_swap(client, instruments, sell_token, buy_token, net_min, ne
                 swaps_done += 1
                 print(f" Logged swap to database. Total today: {swaps_done}/{DAILY_LIMIT}")
                 
-                # PING-PONG FIX: Force next direction
-                pair_key = f"{sell_token}-{buy_token}"
-                _last_swap_direction[pair_key] = "A_TO_B" if sell_token == pair_key.split("-")[0] else "B_TO_A"
+                     # PING-PONG FIX: Force next direction using canonical key
+                pair_key = canonical_pair_key(sell_token, buy_token)
+                # If we sold A to get B, the direction is A_TO_B. Otherwise, it's B_TO_A.
+                _last_swap_direction[pair_key] = "A_TO_B" if sell_token < buy_token else "B_TO_A"
                 
                 await asyncio.sleep(POST_SWAP_COOLDOWN) 
                 return True
@@ -248,18 +256,29 @@ async def main():
             best_opportunity = None
             lowest_fee = Decimal("999.0")
 
-            for pair in TOKEN_PAIRS:
+        for pair in TOKEN_PAIRS:
                 token_a = pair["a"]
                 token_b = pair["b"]
                 net_min = pair["net_min"]
                 net_max = pair["net_max"]
                 
-                # --- NEW: CHECK DISABLED PAIRS ---
-                pair_key = f"{token_a}-{token_b}"
+                pair_key = canonical_pair_key(token_a, token_b)
+                
+                # --- CHECK DISABLED PAIRS ---
                 if pair_key in _disabled_pairs and time.time() < _disabled_pairs[pair_key]:
-                    continue # Skip this pair, it's on timeout
-                # --------------------------------
-
+                    continue
+                
+                # --- LAYER 1 & 2: DIRECTION FILTER ---
+                last_dir = _last_swap_direction.get(pair_key)
+                
+                # Determine the direction of THIS rule
+                # If token_a < token_b, this rule is A_TO_B. Else it's B_TO_A.
+                rule_direction = "A_TO_B" if token_a < token_b else "B_TO_A"
+                
+                # If this rule's direction matches the last direction we just did, skip it.
+                if last_dir == rule_direction:
+                    continue # We just did this direction. Skip.
+                
                 # Check balances
                 account = await client.get_account_info()
                 balance_a = Decimal("0")
@@ -281,18 +300,14 @@ async def main():
                 req_a = (TARGET_SWAP_SIZE_CC / a_price_cc)
                 req_b = (TARGET_SWAP_SIZE_CC / b_price_cc)
 
-                # PING-PONG LOGIC
-                last_dir = _last_swap_direction.get(pair_key)
-                
-                if last_dir == "A_TO_B":
-                    if balance_b >= req_b:
-                        sell, buy, req_sell = token_b, token_a, req_b
-                    else:
-                        continue # Cannot reverse, skip
-                else:
+                # Determine which token to sell based on the rule's direction
+                if rule_direction == "A_TO_B":
                     if balance_a >= req_a:
                         sell, buy, req_sell = token_a, token_b, req_a
-                    elif balance_b >= req_b:
+                    else:
+                        continue
+                else:
+                    if balance_b >= req_b:
                         sell, buy, req_sell = token_b, token_a, req_b
                     else:
                         continue
@@ -321,16 +336,15 @@ async def main():
                         await asyncio.sleep(30)
                         break
                     
-                    # --- NEW: DISABLE PAIR ON ERROR ---
                     print(f" Error on {pair_key}: {e}. Disabling pair for 5 minutes.")
                     _disabled_pairs[pair_key] = time.time() + 300
                     continue
                     # ----------------------------------
 
-            if best_opportunity:
+        if best_opportunity:
                 print(f" Best fee found: {lowest_fee} CC for {best_opportunity['sell']} -> {best_opportunity['buy']}")
                 await check_and_swap(client, instruments, best_opportunity["sell"], best_opportunity["buy"], best_opportunity["net_min"], best_opportunity["net_max"])
-            else:
+        else:
                 print(f" No green fees found. Waiting {RED_LIGHT_WAIT}s...")
                 
                 # --- NEW: Update status file even when waiting ---
