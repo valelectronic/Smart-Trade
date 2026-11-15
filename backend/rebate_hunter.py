@@ -1,7 +1,7 @@
 import asyncio
 import json
 import time
-import requests
+import httpx
 from decimal import Decimal
 import os
 from pathlib import Path
@@ -216,7 +216,8 @@ async def main():
     print(" Fetching active hunter rules from database...")
     TOKEN_PAIRS = []
     try:
-        res = requests.get(f"{API_URL}/api/hunter-rules")
+        async with httpx.AsyncClient() as client_http:
+            res = await client_http.get(f"{API_URL}/api/hunter-rules")
         if res.status_code == 200:
             rules_data = res.json()
             TOKEN_PAIRS = [{"a": r["token_a"], "b": r["token_b"], "net_min": Decimal(str(r.get("net_min", "0.45"))), "net_max": Decimal(str(r.get("net_max", "0.60")))} for r in rules_data]

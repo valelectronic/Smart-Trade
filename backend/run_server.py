@@ -1,4 +1,4 @@
-"""Start the FastAPI server and Cantex monitor together."""
+"""Start the FastAPI server, Cantex monitor, and Rebate Hunter together."""
 
 import asyncio
 import os
@@ -6,15 +6,15 @@ import os
 import uvicorn
 
 from api import app
-# --- CHANGED: Points to new Postgres file ---
 from postgres_database import init_db
 from monitor import run_monitor
-
+from rebate_hunter import main as run_rebate_hunter
 
 HOST = "0.0.0.0"
 PORT = int(os.getenv("PORT", 8000))
 
 MONITOR_RETRY_SECONDS = 5
+HUNTER_RETRY_SECONDS = 10
 
 
 async def monitor_supervisor():
@@ -23,16 +23,26 @@ async def monitor_supervisor():
         try:
             print("[ENGINE] Starting Cantex monitoring engine.")
             await run_monitor()
-
             print("[ENGINE] Monitor stopped; restarting shortly.")
-
         except asyncio.CancelledError:
             raise
-
         except Exception as exc:
             print(f"[ENGINE ERROR] {type(exc).__name__}: {exc}")
-
         await asyncio.sleep(MONITOR_RETRY_SECONDS)
+
+
+async def hunter_supervisor():
+    """Restart the rebate hunter if it exits unexpectedly."""
+    while True:
+        try:
+            print("[HUNTER] Starting Rebate Hunter.")
+            await run_rebate_hunter()
+            print("[HUNTER] Hunter stopped; restarting shortly.")
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            print(f"[HUNTER ERROR] {type(exc).__name__}: {exc}")
+        await asyncio.sleep(HUNTER_RETRY_SECONDS)
 
 
 async def main():
@@ -51,29 +61,29 @@ async def main():
 
     print(f"[API] Starting at http://{HOST}:{PORT}")
     print(f"[API] Documentation: http://{HOST}:{PORT}/docs")
-    print("[SAFETY] Quote-only mode; no swaps will be submitted.")
+    print("[SAFETY] API and Monitor running. Hunter executing swaps.")
 
-    # Start the API server FIRST so Railway's health check passes immediately
+    # Start the API server FIRST
     server_task = asyncio.create_task(server.serve())
-
-    # Give the server a moment to bind to the port
     await asyncio.sleep(2)
 
-    # Now start the monitor in the background
-    monitor_task = asyncio.create_task(
-        monitor_supervisor(),
-        name="cantex-monitor-supervisor",
-    )
+    # Start the monitor
+    monitor_task = asyncio.create_task(monitor_supervisor(), name="cantex-monitor")
+
+    # Start the hunter
+    hunter_task = asyncio.create_task(hunter_supervisor(), name="rebate-hunter")
 
     try:
         await server_task
     finally:
         monitor_task.cancel()
-        try:
-            await monitor_task
-        except asyncio.CancelledError:
-            pass
-        print("[SERVER] API and monitor shutdown complete.")
+        hunter_task.cancel()
+        for task in (monitor_task, hunter_task):
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+        print("[SERVER] API, monitor, and hunter shutdown complete.")
 
 
 if __name__ == "__main__":
