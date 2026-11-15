@@ -3,6 +3,7 @@ import json
 import time
 import requests
 from decimal import Decimal
+import os
 from pathlib import Path
 from cantex_api import connect_sdk
 from helpers import get_cc_balance
@@ -19,7 +20,7 @@ MIN_CC_BALANCE = Decimal("5.0")
 
 # --- NEW: API URL CONFIGURATION ---
 # Use environment variable for deployment, fallback to localhost
-API_URL = "http://127.0.0.1:8000" 
+API_URL = os.getenv("API_URL", "http://127.0.0.1:8000")
 
 PRICES_FILE = Path(__file__).parent / "prices.json"
 STATUS_FILE = Path(__file__).parent / "hunter_status.json"
