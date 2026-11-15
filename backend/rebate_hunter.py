@@ -4,17 +4,15 @@ import time
 import httpx
 from decimal import Decimal
 import os
+from pathlib import Path
+from cantex_api import connect_sdk
+from helpers import get_cc_balance
+from postgres_database import get_today_swap_count, log_successful_swap
 
 def canonical_pair_key(token_a: str, token_b: str) -> str:
     """Sort so MOD::TRKXDEFI and TRKXDEFI::MOD share the same key."""
     a, b = sorted([token_a, token_b])
     return f"{a}::{b}"
-
-
-from pathlib import Path
-from cantex_api import connect_sdk
-from helpers import get_cc_balance
-from postgres_database import get_today_swap_count, log_successful_swap
 
 # --- CONFIGURATION ---
 TARGET_SWAP_SIZE_CC = Decimal("101")
@@ -25,8 +23,6 @@ POST_SWAP_COOLDOWN = 15
 RED_LIGHT_WAIT = 10      
 MIN_CC_BALANCE = Decimal("5.0") 
 
-# --- NEW: API URL CONFIGURATION ---
-# Use environment variable for deployment, fallback to localhost
 API_URL = os.getenv("API_URL", "http://127.0.0.1:8000")
 
 PRICES_FILE = Path(__file__).parent / "prices.json"
@@ -34,12 +30,9 @@ STATUS_FILE = Path(__file__).parent / "hunter_status.json"
 
 swaps_done = 0
 execution_lock = asyncio.Lock() 
-
-# PING-PONG FIX: Tracks last direction per pair
 _last_swap_direction = {} 
-
-# NEW: Tracks pairs that Cantex has temporarily disabled
 _disabled_pairs = {} 
+_net_cc_delta = {} 
 
 def save_status(status_dict):
     try:
@@ -80,14 +73,12 @@ async def check_and_swap(client, instruments, sell_token, buy_token, net_min, ne
     if swaps_done >= DAILY_LIMIT:
         return False
         
-    # 1. Check CC Balance for Gas
     account = await client.get_account_info()
     cc_balance = get_cc_balance(account)
     if cc_balance is not None and cc_balance < MIN_CC_BALANCE:
         print(f" Low CC balance ({cc_balance} CC). Pausing to protect gas.")
         return False
 
-    # 2. Calculate Sizes
     cc_price, usd_price = get_prices_in_cc_and_usd(sell_token)
     if not cc_price or cc_price <= 0:
         return False
@@ -95,7 +86,6 @@ async def check_and_swap(client, instruments, sell_token, buy_token, net_min, ne
     sell_amount_tokens = (TARGET_SWAP_SIZE_CC / cc_price).quantize(Decimal("0.0001"))
     total_usd_value = sell_amount_tokens * usd_price
 
-    # 3. Check if we have enough SELL token balance
     current_balance = Decimal("0")
     for item in getattr(account, "tokens", []) or []:
         symbol = getattr(item, "instrument_symbol", None)
@@ -108,7 +98,6 @@ async def check_and_swap(client, instruments, sell_token, buy_token, net_min, ne
         print(f" Not enough {sell_token} to swap. Have: {current_balance}, Need: {sell_amount_tokens}. Skipping.")
         return False
 
-    # 4. Fetch Quote (With Rate Limit Protection)
     try:
         quote = await client.get_swap_quote(
             sell_amount=sell_amount_tokens,
@@ -125,7 +114,6 @@ async def check_and_swap(client, instruments, sell_token, buy_token, net_min, ne
             print(f" Quote failed for {sell_token}->{buy_token}: {e}")
             return False
 
-    # 5. Parse Fees
     network_fee = Decimal("0")
     pool_fee_percent = Decimal("0")
     sdk_est_time = 0.0
@@ -141,11 +129,9 @@ async def check_and_swap(client, instruments, sell_token, buy_token, net_min, ne
     if exec_sec is not None:
         sdk_est_time = float(exec_sec)
 
-    # 6. Check Targets (Dynamic from API)
     network_ok = net_min <= network_fee <= net_max
     pool_ok = POOL_MIN <= pool_fee_percent <= POOL_MAX
 
-    # Update UI Status File
     save_status({
         "time": time.strftime("%H:%M:%S"),
         "pair": f"{sell_token}->{buy_token}",
@@ -171,14 +157,12 @@ async def check_and_swap(client, instruments, sell_token, buy_token, net_min, ne
                     buy_instrument=instruments[buy_token],
                 )
                 
-                # PARTIAL SWAP GUARD
                 if not result or not result.get("verify"):
                     print(f" PARTIAL SWAP DETECTED. Halting for manual review.")
                     return False
 
                 end_time = time.perf_counter()
                 exec_time = end_time - start_time
-                
                 tx_id = result.get('id')
                 print(f" SWAP SUCCESS in {exec_time:.2f}s! TX ID: {tx_id}")
                 
@@ -196,10 +180,11 @@ async def check_and_swap(client, instruments, sell_token, buy_token, net_min, ne
                 swaps_done += 1
                 print(f" Logged swap to database. Total today: {swaps_done}/{DAILY_LIMIT}")
                 
-                     # PING-PONG FIX: Force next direction using canonical key
                 pair_key = canonical_pair_key(sell_token, buy_token)
-                # If we sold A to get B, the direction is A_TO_B. Otherwise, it's B_TO_A.
                 _last_swap_direction[pair_key] = "A_TO_B" if sell_token < buy_token else "B_TO_A"
+                
+                _net_cc_delta[sell_token] = _net_cc_delta.get(sell_token, Decimal("0")) - TARGET_SWAP_SIZE_CC
+                _net_cc_delta[buy_token] = _net_cc_delta.get(buy_token, Decimal("0")) + TARGET_SWAP_SIZE_CC
                 
                 await asyncio.sleep(POST_SWAP_COOLDOWN) 
                 return True
@@ -211,7 +196,7 @@ async def check_and_swap(client, instruments, sell_token, buy_token, net_min, ne
 
 async def main():
     global swaps_done
-    print(" Starting Rebate Hunter (Rule Engine)...")
+    print(" Starting Rebate Hunter (Adaptive Rule Engine)...")
     
     swaps_done = get_today_swap_count()
     print(f" Today's swaps already completed: {swaps_done}/{DAILY_LIMIT}")
@@ -220,7 +205,6 @@ async def main():
         print(" Daily limit already reached. Bot will sleep.")
         return
 
-    # FETCH ACTIVE RULES FROM DB
     print(" Fetching active hunter rules from database...")
     TOKEN_PAIRS = []
     try:
@@ -256,7 +240,7 @@ async def main():
             best_opportunity = None
             lowest_fee = Decimal("999.0")
 
-        for pair in TOKEN_PAIRS:
+            for pair in TOKEN_PAIRS:
                 token_a = pair["a"]
                 token_b = pair["b"]
                 net_min = pair["net_min"]
@@ -264,22 +248,9 @@ async def main():
                 
                 pair_key = canonical_pair_key(token_a, token_b)
                 
-                # --- CHECK DISABLED PAIRS ---
                 if pair_key in _disabled_pairs and time.time() < _disabled_pairs[pair_key]:
                     continue
                 
-                # --- LAYER 1 & 2: DIRECTION FILTER ---
-                last_dir = _last_swap_direction.get(pair_key)
-                
-                # Determine the direction of THIS rule
-                # If token_a < token_b, this rule is A_TO_B. Else it's B_TO_A.
-                rule_direction = "A_TO_B" if token_a < token_b else "B_TO_A"
-                
-                # If this rule's direction matches the last direction we just did, skip it.
-                if last_dir == rule_direction:
-                    continue # We just did this direction. Skip.
-                
-                # Check balances
                 account = await client.get_account_info()
                 balance_a = Decimal("0")
                 balance_b = Decimal("0")
@@ -297,70 +268,97 @@ async def main():
                 if not a_price_cc or not b_price_cc:
                     continue
 
-                req_a = (TARGET_SWAP_SIZE_CC / a_price_cc)
-                req_b = (TARGET_SWAP_SIZE_CC / b_price_cc)
+                # BUG 3 FIX: Quantize to match check_and_swap's precision
+                req_a = (TARGET_SWAP_SIZE_CC / a_price_cc).quantize(Decimal("0.0001"))
+                req_b = (TARGET_SWAP_SIZE_CC / b_price_cc).quantize(Decimal("0.0001"))
 
-                # Determine which token to sell based on the rule's direction
-                if rule_direction == "A_TO_B":
-                    if balance_a >= req_a:
-                        sell, buy, req_sell = token_a, token_b, req_a
-                    else:
-                        continue
-                else:
-                    if balance_b >= req_b:
-                        sell, buy, req_sell = token_b, token_a, req_b
-                    else:
-                        continue
-
-                # Fetch quote to check fee
-                try:
-                    quote = await client.get_swap_quote(
-                        sell_amount=req_sell,
-                        sell_instrument=instruments[sell],
-                        buy_instrument=instruments[buy],
-                    )
-                    network_fee = Decimal(str(getattr(getattr(quote, "fees", None), "network_fee", None).amount))
-                    
-                    if net_min <= network_fee <= net_max and network_fee < lowest_fee:
-                        lowest_fee = network_fee
-                        best_opportunity = {
-                            "sell": sell,
-                            "buy": buy,
-                            "net_min": net_min,
-                            "net_max": net_max
-                        }
-                except Exception as e:
-                    error_str = str(e).lower()
-                    if "429" in error_str or "rate limit" in error_str:
-                        print(" RATE LIMIT in scan. Cooling down 30s...")
-                        await asyncio.sleep(30)
-                        break
-                    
-                    print(f" Error on {pair_key}: {e}. Disabling pair for 5 minutes.")
-                    _disabled_pairs[pair_key] = time.time() + 300
-                    continue
-                    # ----------------------------------
-
-        if best_opportunity:
-                print(f" Best fee found: {lowest_fee} CC for {best_opportunity['sell']} -> {best_opportunity['buy']}")
-                await check_and_swap(client, instruments, best_opportunity["sell"], best_opportunity["buy"], best_opportunity["net_min"], best_opportunity["net_max"])
-        else:
-                print(f" No green fees found. Waiting {RED_LIGHT_WAIT}s...")
+                last_dir = _last_swap_direction.get(pair_key)
                 
-                # --- NEW: Update status file even when waiting ---
+                possible_directions = []
+                
+                if balance_a >= req_a:
+                    possible_directions.append({"sell": token_a, "buy": token_b, "amount": req_a, "dir": "A_TO_B"})
+                if balance_b >= req_b:
+                    possible_directions.append({"sell": token_b, "buy": token_a, "amount": req_b, "dir": "B_TO_A"})
+                
+                if not possible_directions:
+                    continue
+
+                if last_dir == "A_TO_B":
+                    possible_directions.sort(key=lambda x: 0 if x["dir"] == "B_TO_A" else 1)
+                else:
+                    possible_directions.sort(key=lambda x: 0 if x["dir"] == "A_TO_B" else 1)
+
+                for direction in possible_directions:
+                    sell = direction["sell"]
+                    buy = direction["buy"]
+                    req_sell = direction["amount"]
+                    
+                    if _net_cc_delta.get(buy, Decimal("0")) + TARGET_SWAP_SIZE_CC > Decimal("200"):
+                        print(f" [STACK GUARD] Skipping {sell}->{buy}. Too much {buy} stacked.")
+                        continue
+
+                    try:
+                        quote = await client.get_swap_quote(
+                            sell_amount=req_sell,
+                            sell_instrument=instruments[sell],
+                            buy_instrument=instruments[buy],
+                        )
+                        network_fee = Decimal(str(getattr(getattr(quote, "fees", None), "network_fee", None).amount))
+                        
+                        if net_min <= network_fee <= net_max and network_fee < lowest_fee:
+                            lowest_fee = network_fee
+                            best_opportunity = {
+                                "sell": sell,
+                                "buy": buy,
+                                "amount": req_sell,
+                                "dir": direction["dir"],
+                                "net_min": net_min,
+                                "net_max": net_max
+                            }
+                    except Exception as e:
+                        error_str = str(e).lower()
+                        if "429" in error_str or "rate limit" in error_str:
+                            print(" RATE LIMIT in scan. Cooling down 30s...")
+                            await asyncio.sleep(30)
+                            break
+                        
+                        print(f" Error on {pair_key}: {e}. Disabling pair for 5 minutes.")
+                        _disabled_pairs[pair_key] = time.time() + 300
+                        break
+
+            if best_opportunity:
+                print(f" Best fee found: {lowest_fee} CC for {best_opportunity['sell']} -> {best_opportunity['buy']}")
+                executed = await check_and_swap(client, instruments, best_opportunity["sell"], best_opportunity["buy"], best_opportunity["net_min"], best_opportunity["net_max"])
+                if not executed:
+                    await asyncio.sleep(2)
+                    save_status({
+                        "time": time.strftime("%H:%M:%S"),
+                        "pair": "Scanning...",
+                        "net_fee": 0,
+                        "pool_fee": 0,
+                        "usd_value": 0,
+                        "cc_size": float(TARGET_SWAP_SIZE_CC),
+                        "sdk_est_time": 0,
+                        "status": " WAITING",
+                        "swaps_done": swaps_done
+                    })
+            else:
+                # No green fees this cycle — must pause, or the loop spins with no sleep
+                print(f" No green fees found. Waiting {RED_LIGHT_WAIT}s...")
                 save_status({
                     "time": time.strftime("%H:%M:%S"),
                     "pair": "Scanning...",
                     "net_fee": 0,
                     "pool_fee": 0,
                     "usd_value": 0,
-                    "cc_size": 100.5,
+                    "cc_size": float(TARGET_SWAP_SIZE_CC),
                     "sdk_est_time": 0,
                     "status": " WAITING",
                     "swaps_done": swaps_done
                 })
-            
                 await asyncio.sleep(RED_LIGHT_WAIT)
+
     except KeyboardInterrupt:
         print("\n Stopped by user.")
     finally:
