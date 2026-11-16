@@ -2,17 +2,18 @@
 
 import { useState, useEffect } from "react";
 import { HunterDashboard } from "@/components/HunterDashboard";
-import { Wallet, Activity, Bell, TrendingUp, Crosshair } from "lucide-react";
+import { Activity, Bell, TrendingUp, Crosshair } from "lucide-react";
+
+// HARDCODED API URL (no env variable)
+const API_URL = "https://smart-trade-production-44e4.up.railway.app";
 
 export default function Home() {
   const [activeTab, setActiveTab] = useState<"portfolio" | "hunter">("portfolio");
   const [isMounted, setIsMounted] = useState(false);
   
-  // Portfolio Value State
   const [totalPortfolioValue, setTotalPortfolioValue] = useState<number>(0);
   const [isFetchingValue, setIsFetchingValue] = useState(false);
   
-  // Market Prices (Static)
   const [ccPrice, setCcPrice] = useState<number>(0);
   const [btcPrice, setBtcPrice] = useState<number>(0);
 
@@ -30,7 +31,6 @@ export default function Home() {
     }
   }, [activeTab, isMounted]);
 
-  // Fetch Portfolio + Market Prices
   useEffect(() => {
     let isCancelled = false;
 
@@ -38,9 +38,7 @@ export default function Home() {
       setIsFetchingValue(true);
       
       try {
-        // 1. Fetch Portfolio Value
-        const apiUrl = process.env.NEXT_PUBLIC_API_URL || "http://127.0.0.1:8000";
-        const res = await fetch(`${apiUrl}/api/portfolio-value`);
+        const res = await fetch(`${API_URL}/api/portfolio-value`);
         const data = await res.json();
         
         if (data.status === "success" && data.total_usd && !isCancelled) {
@@ -50,19 +48,15 @@ export default function Home() {
           }
         }
 
-        // 2. Fetch Market Prices (static from prices.json via a tiny endpoint)
-        // We use the same portfolio endpoint's data if it contains the prices,
-        // or we can add a tiny /api/market-prices endpoint later.
-        // For now, we will read from a separate fetch if available.
         try {
-          const marketRes = await fetch(`${apiUrl}/api/market-prices`);
+          const marketRes = await fetch(`${API_URL}/api/market-prices`);
           const marketData = await marketRes.json();
           if (!isCancelled) {
             setCcPrice(marketData.cc_usd || 0);
             setBtcPrice(marketData.btc_usd || 0);
           }
         } catch {
-          // Market prices endpoint not yet added. Use defaults.
+          // Silent fail
         }
 
       } catch (err) {
@@ -73,7 +67,7 @@ export default function Home() {
     };
     
     fetchData();
-    const interval = setInterval(fetchData, 15000); // Every 15s
+    const interval = setInterval(fetchData, 15000);
     
     return () => {
       isCancelled = true;
@@ -85,7 +79,7 @@ export default function Home() {
     <div className="min-h-screen flex flex-col w-full">
       
       {/* DESKTOP TOP NAVBAR */}
-      <nav className="hidden md:flex border-b border-shadow-grey bg-onyx px-6 py-4 items-center justify-between sticky top-0 z-50">
+      <nav className="hidden md:flex border-b border-shadow-grey bg-onyx px-6 py-3 items-center justify-between sticky top-0 z-50">
         <div className="flex items-center gap-3">
           <div className="h-8 w-8 bg-emerald rounded-lg flex items-center justify-center font-bold text-onyx-dark shadow-[0_0_15px_rgba(34,220,149,0.3)]">
             C
@@ -101,26 +95,28 @@ export default function Home() {
       </nav>
 
       {/* MOBILE TOP HEADER */}
-      <div className="md:hidden border-b border-shadow-grey bg-onyx px-4 py-3 flex items-center justify-between sticky top-0 z-50">
+      <div className="md:hidden border-b border-shadow-grey bg-onyx px-4 py-2.5 flex items-center justify-between sticky top-0 z-50">
         <div className="flex items-center gap-2">
           <div className="h-6 w-6 bg-emerald rounded flex items-center justify-center font-bold text-onyx-dark text-xs">C</div>
-          <span className="font-semibold text-snow">Cantex</span>
+          <span className="font-semibold text-snow text-sm">Cantex</span>
         </div>
-        <Bell size={18} className="text-granite" />
+        <Bell size={16} className="text-granite" />
       </div>
 
-      {/* STATIC MARKET BAR (No Polling) */}
-      <div className="bg-carbon border-b border-jet-black px-6 py-2 flex items-center justify-between text-xs md:text-sm text-granite font-mono">
-        <div className="flex items-center gap-2">
-          <span className="text-amber-400 font-bold">₿</span>
-          <span>BTC/USD</span>
+      {/* STICKY MARKET BAR */}
+      <div className="sticky top-[48px] md:top-[57px] z-40 bg-carbon border-b border-jet-black px-4 md:px-6 py-2 flex items-center justify-between text-[10px] md:text-sm text-granite font-mono">
+        <div className="flex items-center gap-1.5 md:gap-2">
+          <span className="text-amber-400 font-bold text-xs">₿</span>
+          <span className="hidden sm:inline">BTC/USD</span>
+          <span className="sm:hidden">BTC</span>
           <span className="text-snow font-bold">
             {btcPrice > 0 ? `$${btcPrice.toLocaleString(undefined, { maximumFractionDigits: 2 })}` : "---"}
           </span>
         </div>
-        <div className="flex items-center gap-2">
-          <span className="text-emerald font-bold">◎</span>
-          <span>CC/USDC</span>
+        <div className="flex items-center gap-1.5 md:gap-2">
+          <span className="text-emerald font-bold text-xs">◎</span>
+          <span className="hidden sm:inline">CC/USDC</span>
+          <span className="sm:hidden">CC</span>
           <span className="text-snow font-bold">
             {ccPrice > 0 ? `$${ccPrice.toFixed(5)}` : "---"}
           </span>
@@ -128,45 +124,45 @@ export default function Home() {
       </div>
 
       {/* Main Content */}
-      <main className="flex-1 max-w-5xl w-full mx-auto p-4 md:p-8 pb-24 md:pb-8">
+      <main className="flex-1 max-w-5xl w-full mx-auto p-3 md:p-8 pb-24 md:pb-8">
         
         {/* PORTFOLIO VALUE CARD */}
-        <div className="bg-carbon border border-jet-black rounded-2xl p-5 mb-6 flex items-center justify-between">
+        <div className="bg-carbon border border-jet-black rounded-xl md:rounded-2xl p-4 md:p-5 mb-4 md:mb-6 flex items-center justify-between">
           <div>
-            <p className="text-xs text-granite mb-1 uppercase tracking-wider font-semibold">Estimated Total Value</p>
-            <h2 className="text-3xl font-bold text-snow font-mono">
+            <p className="text-[10px] md:text-xs text-granite mb-1 uppercase tracking-wider font-semibold">Estimated Total Value</p>
+            <h2 className="text-2xl md:text-3xl font-bold text-snow font-mono">
               {isFetchingValue ? "..." : `$${totalPortfolioValue.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })} USD`}
             </h2>
           </div>
-          <div className="p-3 bg-emerald/10 rounded-xl">
-            <TrendingUp size={24} className="text-emerald" />
+          <div className="p-2 md:p-3 bg-emerald/10 rounded-lg md:rounded-xl">
+            <TrendingUp size={20} className="text-emerald md:w-6 md:h-6" />
           </div>
         </div>
 
         {/* TABS: Portfolio | Hunter */}
-        <div className="mb-6 flex flex-col md:flex-row md:items-end justify-between gap-4">
+        <div className="mb-4 md:mb-6 flex flex-col md:flex-row md:items-end justify-between gap-3 md:gap-4">
           <div>
-            <h1 className="text-xl md:text-2xl font-medium text-snow mb-1">Trading Dashboard</h1>
-            <p className="text-granite text-sm">Manage your strategies.</p>
+            <h1 className="text-lg md:text-2xl font-medium text-snow mb-0.5 md:mb-1">Trading Dashboard</h1>
+            <p className="text-granite text-xs md:text-sm">Manage your strategies.</p>
           </div>
 
-          <div className="flex bg-carbon p-1 rounded-xl border border-jet-black w-full md:w-auto">
+          <div className="flex bg-carbon p-1 rounded-lg md:rounded-xl border border-jet-black w-full md:w-auto">
             <button
               onClick={() => setActiveTab("portfolio")}
-              className={`flex-1 md:flex-none flex items-center justify-center gap-2 px-6 py-2 text-sm font-medium rounded-lg transition-all ${
+              className={`flex-1 md:flex-none flex items-center justify-center gap-1.5 md:gap-2 px-4 md:px-6 py-2 text-xs md:text-sm font-medium rounded-md md:rounded-lg transition-all ${
                 activeTab === "portfolio" ? "bg-jet-black text-emerald shadow-sm" : "text-granite hover:text-snow"
               }`}
             >
-              <Activity size={16} />
+              <Activity size={14} className="md:w-4 md:h-4" />
               Portfolio
             </button>
             <button
               onClick={() => setActiveTab("hunter")}
-              className={`flex-1 md:flex-none flex items-center justify-center gap-2 px-6 py-2 text-sm font-medium rounded-lg transition-all ${
+              className={`flex-1 md:flex-none flex items-center justify-center gap-1.5 md:gap-2 px-4 md:px-6 py-2 text-xs md:text-sm font-medium rounded-md md:rounded-lg transition-all ${
                 activeTab === "hunter" ? "bg-jet-black text-emerald shadow-sm" : "text-granite hover:text-snow"
               }`}
             >
-              <Crosshair size={16} />
+              <Crosshair size={14} className="md:w-4 md:h-4" />
               Hunter
             </button>
           </div>
@@ -176,9 +172,9 @@ export default function Home() {
         <div className="w-full">
           {activeTab === "portfolio" && (
             <div className="w-full animate-in fade-in duration-300">
-              <div className="bg-onyx border border-shadow-grey rounded-2xl p-6 text-center text-granite">
-                <p className="text-sm">Portfolio details and history will appear here.</p>
-                <p className="text-xs mt-2 text-granite/50">Use the Hunter tab to manage your rebate rules.</p>
+              <div className="bg-onyx border border-shadow-grey rounded-xl md:rounded-2xl p-5 md:p-6 text-center text-granite">
+                <p className="text-xs md:text-sm">Portfolio details and history will appear here.</p>
+                <p className="text-[10px] md:text-xs mt-2 text-granite/50">Use the Hunter tab to manage your rebate rules.</p>
               </div>
             </div>
           )}

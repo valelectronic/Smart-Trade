@@ -53,6 +53,7 @@ async def hunter_supervisor():
         except Exception as exc:
             print(f"[HUNTER ERROR] {type(exc).__name__}: {exc}")
             await asyncio.sleep(10)
+            
 
 
 async def main():
