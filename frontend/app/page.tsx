@@ -67,7 +67,7 @@ export default function Home() {
     };
     
     fetchData();
-    const interval = setInterval(fetchData, 15000);
+    const interval = setInterval(fetchData, 30000);// Fetch every 30 seconds
     
     return () => {
       isCancelled = true;

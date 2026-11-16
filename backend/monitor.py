@@ -96,6 +96,40 @@ async def discover_hunter_channels():
         print(f"[HUNTER FETCH ERROR] {e}")
     return market_channels
 
+# --- NEW FUNCTION ADDED HERE ---
+async def discover_wallet_channels(client):
+    """Fetch top 5 tokens by balance in the user's wallet and subscribe to their -CC markets."""
+    market_channels = {}
+    try:
+        account = await client.get_account_info()
+        balances = []
+        for item in getattr(account, "tokens", []) or []:
+            symbol = getattr(item, "instrument_symbol", None)
+            unlocked = getattr(item, "unlocked_amount", None)
+            if symbol and unlocked is not None and float(unlocked) > 0:
+                token = str(symbol).upper()
+                if token == "CC":
+                    continue
+                balances.append((token, float(unlocked)))
+        
+        # Sort by balance descending, take top 5
+        balances.sort(key=lambda x: x[1], reverse=True)
+        top_tokens = [b[0] for b in balances[:5]]
+        
+        for token in top_tokens:
+            market_symbol = f"{token}-CC"
+            if market_symbol not in market_channels:
+                try:
+                    _, channel = await asyncio.to_thread(discover_market, market_symbol)
+                    market_channels[market_symbol] = channel
+                    print(f"[WALLET] Verified: {market_symbol}; ticker={channel}")
+                except Exception as e:
+                    print(f"[WALLET ERROR] Could not discover {market_symbol}: {e}")
+    except Exception as e:
+        print(f"[WALLET FETCH ERROR] {e}")
+    return market_channels
+# -------------------------------
+
 async def run_monitor():
     client = await connect_sdk()
     
@@ -123,6 +157,11 @@ async def run_monitor():
         if last_db_fetch_time == 0:
             hunter_channels = await discover_hunter_channels()
             market_channels.update(hunter_channels)
+            
+            # Subscribe to top 5 wallet tokens
+            wallet_channels = await discover_wallet_channels(client)
+            market_channels.update(wallet_channels)
+            
             last_db_fetch_time = time.monotonic()
 
         subscribed_channels = sorted(set(market_channels.values()) | {rate_channel, btc_channel})

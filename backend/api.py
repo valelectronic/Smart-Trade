@@ -3,6 +3,7 @@
 import asyncio
 import json
 import time
+import requests  # <-- ADDED
 from pathlib import Path
 from contextlib import asynccontextmanager
 from decimal import Decimal
@@ -12,12 +13,18 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 from cantex_api import connect_sdk
+from config import PUBLIC_BASE  # <-- ADDED
 from postgres_database import (
     init_db,
     get_connection,
     get_today_fees_spent,
     delete_hunter_rule,
 )
+
+# --- All Tokens Cache ---
+_all_tokens_cache = {"tokens": [], "timestamp": 0}
+
+# ... (the rest of your api.py stays exactly the same) ...
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -206,6 +213,38 @@ def get_market_prices():
         "btc_usd": float(prices.get("BTC-USDC", 0)),
         "status": "success"
     }
+
+@app.get("/api/all-tokens")
+def get_all_tokens():
+    """Returns all tradeable tokens on Cantex with a 10-minute cache."""
+    global _all_tokens_cache
+    now = time.time()
+    
+    if now - _all_tokens_cache["timestamp"] < 600:  # 10 minutes
+        return _all_tokens_cache["tokens"]
+    
+    try:
+        response = requests.get(f"{PUBLIC_BASE}/markets/info", timeout=10)
+        response.raise_for_status()
+        markets = response.json().get("data", {}).get("markets", [])
+        
+        tokens = set()
+        for m in markets:
+            symbol = m.get("symbol", "")
+            parts = symbol.split("-")
+            if len(parts) == 2:
+                tokens.add(parts[0].upper())
+                tokens.add(parts[1].upper())
+        
+        tokens.discard("CC")
+        tokens.discard("USDC")
+        tokens.discard("USDCX")
+        
+        result = sorted(list(tokens))
+        _all_tokens_cache = {"tokens": result, "timestamp": now}
+        return result
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 if __name__ == "__main__":
     import uvicorn
