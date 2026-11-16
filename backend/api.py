@@ -120,6 +120,28 @@ async def get_portfolio_value():
     except Exception as e:
         return {"error": str(e), "status": "failed"}
 
+@app.get("/api/balances")
+async def get_balances():
+    try:
+        client = await connect_sdk()
+        try:
+            account = await client.get_account_info()
+            balances = {}
+            for item in getattr(account, "tokens", []) or []:
+                symbol = getattr(item, "instrument_symbol", None)
+                unlocked = getattr(item, "unlocked_amount", None)
+                if symbol and unlocked is not None:
+                    balances[symbol.upper()] = str(Decimal(str(unlocked)))
+            return balances
+        finally:
+            close = getattr(client, "close", None)
+            if close:
+                result = close()
+                if asyncio.iscoroutine(result):
+                    await result
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
 @app.get("/api/hunter-status")
 def get_hunter_status():
     status_file = Path(__file__).parent / "hunter_status.json"

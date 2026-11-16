@@ -30,6 +30,7 @@ PRICES_FILE = Path(__file__).parent / "prices.json"
 STATUS_FILE = Path(__file__).parent / "hunter_status.json"
 
 swaps_done = 0
+swap_halted = False
 execution_lock = asyncio.Lock() 
 _last_swap_direction = {} 
 _disabled_pairs = {} 
@@ -64,12 +65,16 @@ def get_prices_in_cc_and_usd(token_symbol):
         return None, None
 
 async def check_and_swap(client, instruments, sell_token, buy_token, net_min, net_max, sell_amount_tokens):
-    global swaps_done
+    global swaps_done, swap_halted
     
     if swaps_done >= DAILY_LIMIT:
         return False
         
-    account = await client.get_account_info()
+    try:
+        account = await client.get_account_info()
+    except Exception as e:
+        print(f" Could not fetch account info: {e}")
+        return False
     cc_balance = get_cc_balance(account)
     if cc_balance is not None and cc_balance < MIN_CC_BALANCE:
         print(f" Low CC balance ({cc_balance} CC). Pausing to protect gas.")
@@ -154,6 +159,7 @@ async def check_and_swap(client, instruments, sell_token, buy_token, net_min, ne
                 
                 if not result or not result.get("verify"):
                     print(f" PARTIAL SWAP DETECTED. Halting for manual review.")
+                    swap_halted = True
                     return False
 
                 end_time = time.perf_counter()
@@ -189,6 +195,36 @@ async def check_and_swap(client, instruments, sell_token, buy_token, net_min, ne
     else:
         return False
 
+
+async def fetch_active_hunter_rules():
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client_http:
+            res = await client_http.get(
+                f"{API_URL}/api/hunter-rules"
+            )
+
+        if res.status_code != 200:
+            print(f" API Error: {res.status_code}")
+            return None
+
+        rules_data = res.json()
+
+        token_pairs = [
+            {
+                "a": r["token_a"],
+                "b": r["token_b"],
+                "net_min": Decimal(str(r.get("net_min", "0.45"))),
+                "net_max": Decimal(str(r.get("net_max", "0.60")))
+            }
+            for r in rules_data
+        ]
+
+        return token_pairs
+
+    except Exception as e:
+        print(f" Failed to fetch hunter rules: {e}")
+        return None
+
 async def main():
     global swaps_done
     print(" Starting Rebate Hunter (Dynamic 100-102 CC + Strict Ping-Pong)...")
@@ -216,25 +252,6 @@ async def main():
     except Exception as e:
         print(f" Could not restore ping-pong memory: {e}")
 
-    print(" Fetching active hunter rules from database...")
-    TOKEN_PAIRS = []
-    try:
-        async with httpx.AsyncClient() as client_http:
-            res = await client_http.get(f"{API_URL}/api/hunter-rules")
-        if res.status_code == 200:
-            rules_data = res.json()
-            TOKEN_PAIRS = [{"a": r["token_a"], "b": r["token_b"], "net_min": Decimal(str(r.get("net_min", "0.45"))), "net_max": Decimal(str(r.get("net_max", "0.60")))} for r in rules_data]
-            print(f" Loaded {len(TOKEN_PAIRS)} rules: {TOKEN_PAIRS}")
-        else:
-            print(f" API Error: {res.status_code}")
-            return False
-    except Exception as e:
-        print(f" Failed to connect to API: {e}")
-        return False
-        
-    if not TOKEN_PAIRS:
-        print(" No active rules found. Sleeping for 60 seconds.")
-        return "NO_RULES"
 
     client = await connect_sdk()
     
@@ -247,11 +264,41 @@ async def main():
             if symbol and instrument is not None:
                 instruments[str(symbol).upper()] = instrument
 
-        while swaps_done < DAILY_LIMIT:
+        while swaps_done < DAILY_LIMIT and not swap_halted:
+
+            # Always refresh active rules from the database
+            TOKEN_PAIRS = await fetch_active_hunter_rules()
+
+            # API unavailable: pause and retry
+            if TOKEN_PAIRS is None:
+                print(" Could not refresh rules. Retrying in 15 seconds...")
+                await asyncio.sleep(15)
+                continue
+
+            # No active rules: wait
+            if not TOKEN_PAIRS:
+                print(" NO ACTIVE RULES. Waiting 60 seconds...")
+                save_status({
+                    "time": time.strftime("%H:%M:%S"),
+                    "pair": "NO_RULES",
+                    "net_fee": 0,
+                    "pool_fee": 0,
+                    "usd_value": 0,
+                    "cc_size": 0,
+                    "sdk_est_time": 0,
+                    "status": "NO_RULES",
+                    "swaps_done": swaps_done
+                })
+                await asyncio.sleep(60)
+                continue
+
+            print(f" Active rules: {len(TOKEN_PAIRS)}")
+
             best_opportunity = None
             lowest_fee = Decimal("999.0")
 
             for pair in TOKEN_PAIRS:
+            
                 token_a = pair["a"]
                 token_b = pair["b"]
                 net_min = pair["net_min"]
@@ -262,7 +309,11 @@ async def main():
                 if pair_key in _disabled_pairs and time.time() < _disabled_pairs[pair_key]:
                     continue
                 
-                account = await client.get_account_info()
+                try:
+                    account = await client.get_account_info()
+                except Exception as e:
+                    print(f" Could not fetch account info: {e}")
+                    break
                 balance_a = Decimal("0")
                 balance_b = Decimal("0")
                 for item in getattr(account, "tokens", []) or []:
@@ -325,9 +376,13 @@ async def main():
                             sell_instrument=instruments[sell],
                             buy_instrument=instruments[buy],
                         )
-                        network_fee = Decimal(str(getattr(getattr(quote, "fees", None), "network_fee", None).amount))
-                        
-                        if net_min <= network_fee <= net_max and network_fee < lowest_fee:
+                        fees_obj = getattr(quote, "fees", None)
+                        network_fee = Decimal(str(fees_obj.network_fee.amount))
+                        pool_fee_percent = Decimal(str(getattr(fees_obj, "fee_percentage", 0))) * 100
+
+                        if (net_min <= network_fee <= net_max
+                                and POOL_MIN <= pool_fee_percent <= POOL_MAX
+                                and network_fee < lowest_fee):
                             lowest_fee = network_fee
                             best_opportunity = {
                                 "sell": sell,

@@ -70,9 +70,11 @@ export function HunterDashboard() {
       }
     };
 
-    const fetchBalances = async () => {
+        const fetchBalances = async () => {
       try {
-        const data = await getBalances();
+        const res = await fetch(`${apiUrl}/api/balances`);
+        if (!res.ok) return;
+        const data = await res.json();
         const upper: Record<string, string> = {};
         Object.keys(data).forEach(k => upper[k.toUpperCase()] = data[k]);
         setWalletBalances(upper);
