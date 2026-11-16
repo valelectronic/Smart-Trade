@@ -233,8 +233,8 @@ async def main():
         return False
         
     if not TOKEN_PAIRS:
-        print(" No active rules found. Exiting.")
-        return False
+        print(" No active rules found. Sleeping for 60 seconds.")
+        return "NO_RULES"
 
     client = await connect_sdk()
     

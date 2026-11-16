@@ -33,25 +33,26 @@ async def monitor_supervisor():
 
 
 async def hunter_supervisor():
-    """Restart the rebate hunter if it exits unexpectedly."""
     while True:
         try:
             print("[HUNTER] Starting Rebate Hunter.")
-            # run_rebate_hunter returns True if daily limit reached, False otherwise
-            finished_daily_limit = await run_rebate_hunter()
+            result = await run_rebate_hunter()
             
-            if finished_daily_limit:
-                print(f"[HUNTER] Daily limit reached. Sleeping for {HUNTER_DAILY_LIMIT_SLEEP}s.")
-                await asyncio.sleep(HUNTER_DAILY_LIMIT_SLEEP)
+            if result is True:
+                print(f"[HUNTER] Daily limit reached. Sleeping for 1 hour.")
+                await asyncio.sleep(3600)
+            elif result == "NO_RULES":
+                print(f"[HUNTER] No rules found. Checking again in 60 seconds.")
+                await asyncio.sleep(60)  # 60 seconds, not 5 minutes
             else:
-                print(f"[HUNTER] Hunter stopped unexpectedly. Retrying in {HUNTER_RETRY_SECONDS}s.")
-                await asyncio.sleep(HUNTER_RETRY_SECONDS)
+                print(f"[HUNTER] Hunter stopped unexpectedly. Retrying in 10 seconds.")
+                await asyncio.sleep(10)
                 
         except asyncio.CancelledError:
             raise
         except Exception as exc:
             print(f"[HUNTER ERROR] {type(exc).__name__}: {exc}")
-            await asyncio.sleep(HUNTER_RETRY_SECONDS)
+            await asyncio.sleep(10)
 
 
 async def main():
