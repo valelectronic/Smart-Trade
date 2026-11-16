@@ -1,82 +1,85 @@
 "use client";
 
 import { useState, useEffect } from "react";
-import { OrderForm } from "@/components/orderForm";
-import { OrderTable } from "@/components/orderTable";
-import { HunterDashboard } from "@/components/HunterDashboard"; // <-- NEW IMPORT
-import { MarketBar } from "@/components/marketBar"; 
-import { Wallet, Activity, Bell, PlusCircle, List, TrendingUp, Crosshair } from "lucide-react"; // <-- Added Crosshair
+import { HunterDashboard } from "@/components/HunterDashboard";
+import { Wallet, Activity, Bell, TrendingUp, Crosshair } from "lucide-react";
 
 export default function Home() {
-  const [refreshTrigger, setRefreshTrigger] = useState(0);
-  const [activeTab, setActiveTab] = useState<"create" | "orders" | "hunter">("create");
+  const [activeTab, setActiveTab] = useState<"portfolio" | "hunter">("portfolio");
   const [isMounted, setIsMounted] = useState(false);
   
   // Portfolio Value State
   const [totalPortfolioValue, setTotalPortfolioValue] = useState<number>(0);
   const [isFetchingValue, setIsFetchingValue] = useState(false);
+  
+  // Market Prices (Static)
+  const [ccPrice, setCcPrice] = useState<number>(0);
+  const [btcPrice, setBtcPrice] = useState<number>(0);
 
-  // Load saved tab safely after mounting
   useEffect(() => {
     const saved = localStorage.getItem("cantex_activeTab");
-    if (saved === "create" || saved === "orders" || saved === "hunter") {
+    if (saved === "portfolio" || saved === "hunter") {
       setActiveTab(saved);
     }
     setIsMounted(true);
   }, []);
 
-  // Save tab whenever it changes (but only after initial mount)
   useEffect(() => {
     if (isMounted) {
       localStorage.setItem("cantex_activeTab", activeTab);
     }
   }, [activeTab, isMounted]);
 
-  // Fetch Total Portfolio Value
+  // Fetch Portfolio + Market Prices
   useEffect(() => {
     let isCancelled = false;
 
-    const fetchPortfolioValue = async () => {
+    const fetchData = async () => {
       setIsFetchingValue(true);
       
-      const timeoutId = setTimeout(() => {
-        if (!isCancelled) setIsFetchingValue(false);
-      }, 8000); 
-
       try {
-        const res = await fetch(`${process.env.NEXT_PUBLIC_API_URL}/portfolio-value`);
+        // 1. Fetch Portfolio Value
+        const apiUrl = process.env.NEXT_PUBLIC_API_URL || "http://127.0.0.1:8000";
+        const res = await fetch(`${apiUrl}/api/portfolio-value`);
         const data = await res.json();
         
-                if (data.status === "success" && data.total_usd && !isCancelled) {
+        if (data.status === "success" && data.total_usd && !isCancelled) {
           const parsedValue = parseFloat(data.total_usd);
           if (!isNaN(parsedValue)) {
             setTotalPortfolioValue(parsedValue);
           }
-        } else {
-          // Silently ignore background errors so we don't spam the console
-          // The next poll in 5 seconds will likely succeed
         }
+
+        // 2. Fetch Market Prices (static from prices.json via a tiny endpoint)
+        // We use the same portfolio endpoint's data if it contains the prices,
+        // or we can add a tiny /api/market-prices endpoint later.
+        // For now, we will read from a separate fetch if available.
+        try {
+          const marketRes = await fetch(`${apiUrl}/api/market-prices`);
+          const marketData = await marketRes.json();
+          if (!isCancelled) {
+            setCcPrice(marketData.cc_usd || 0);
+            setBtcPrice(marketData.btc_usd || 0);
+          }
+        } catch {
+          // Market prices endpoint not yet added. Use defaults.
+        }
+
       } catch (err) {
-        console.error("Failed to fetch portfolio value", err);
+        // Silent fail
       } finally {
-        clearTimeout(timeoutId);
         if (!isCancelled) setIsFetchingValue(false);
       }
     };
     
-    fetchPortfolioValue();
-    
-    const interval = setInterval(fetchPortfolioValue, 60000);
+    fetchData();
+    const interval = setInterval(fetchData, 15000); // Every 15s
     
     return () => {
       isCancelled = true;
       clearInterval(interval);
     };
   }, []);
-
-  const handleOrderCreated = () => {
-    setRefreshTrigger((p) => p + 1);
-  };
 
   return (
     <div className="min-h-screen flex flex-col w-full">
@@ -90,13 +93,9 @@ export default function Home() {
           <span className="font-semibold text-lg tracking-tight text-snow">Cantex Terminal</span>
         </div>
         <div className="flex items-center gap-6 text-sm text-granite">
-          <div className="flex items-center gap-2 cursor-pointer text-emerald">
+          <div className="flex items-center gap-2 text-emerald">
             <Activity size={16} />
             <span>Dashboard</span>
-          </div>
-          <div className="flex items-center gap-2 cursor-pointer hover:text-snow transition-colors">
-            <Wallet size={16} />
-            <span>Wallet</span>
           </div>
         </div>
       </nav>
@@ -110,15 +109,28 @@ export default function Home() {
         <Bell size={18} className="text-granite" />
       </div>
 
-      {/* MARKET BAR (Sticky) */}
-      <div className="sticky top-[57px] md:top-[69px] z-40 w-full overflow-hidden">
-        <MarketBar />
+      {/* STATIC MARKET BAR (No Polling) */}
+      <div className="bg-carbon border-b border-jet-black px-6 py-2 flex items-center justify-between text-xs md:text-sm text-granite font-mono">
+        <div className="flex items-center gap-2">
+          <span className="text-amber-400 font-bold">₿</span>
+          <span>BTC/USD</span>
+          <span className="text-snow font-bold">
+            {btcPrice > 0 ? `$${btcPrice.toLocaleString(undefined, { maximumFractionDigits: 2 })}` : "---"}
+          </span>
+        </div>
+        <div className="flex items-center gap-2">
+          <span className="text-emerald font-bold">◎</span>
+          <span>CC/USDC</span>
+          <span className="text-snow font-bold">
+            {ccPrice > 0 ? `$${ccPrice.toFixed(5)}` : "---"}
+          </span>
+        </div>
       </div>
 
       {/* Main Content */}
       <main className="flex-1 max-w-5xl w-full mx-auto p-4 md:p-8 pb-24 md:pb-8">
         
-        {/* --- TOTAL PORTFOLIO VALUE CARD --- */}
+        {/* PORTFOLIO VALUE CARD */}
         <div className="bg-carbon border border-jet-black rounded-2xl p-5 mb-6 flex items-center justify-between">
           <div>
             <p className="text-xs text-granite mb-1 uppercase tracking-wider font-semibold">Estimated Total Value</p>
@@ -131,37 +143,26 @@ export default function Home() {
           </div>
         </div>
 
-        {/* Header & Tabs */}
+        {/* TABS: Portfolio | Hunter */}
         <div className="mb-6 flex flex-col md:flex-row md:items-end justify-between gap-4">
           <div>
             <h1 className="text-xl md:text-2xl font-medium text-snow mb-1">Trading Dashboard</h1>
-            <p className="text-granite text-sm">Manage your semi-automated strategies.</p>
+            <p className="text-granite text-sm">Manage your strategies.</p>
           </div>
 
-          {/* Tab Switcher - Desktop & Mobile (Scrollable if needed) */}
-          <div className="flex bg-carbon p-1 rounded-xl border border-jet-black w-full md:w-auto overflow-x-auto no-scrollbar">
+          <div className="flex bg-carbon p-1 rounded-xl border border-jet-black w-full md:w-auto">
             <button
-              onClick={() => setActiveTab("create")}
-              className={`flex-1 md:flex-none flex items-center justify-center gap-2 px-4 md:px-6 py-2 text-xs md:text-sm font-medium rounded-lg transition-all whitespace-nowrap ${
-                activeTab === "create" ? "bg-jet-black text-emerald shadow-sm" : "text-granite hover:text-snow"
+              onClick={() => setActiveTab("portfolio")}
+              className={`flex-1 md:flex-none flex items-center justify-center gap-2 px-6 py-2 text-sm font-medium rounded-lg transition-all ${
+                activeTab === "portfolio" ? "bg-jet-black text-emerald shadow-sm" : "text-granite hover:text-snow"
               }`}
             >
-              <PlusCircle size={16} />
-              Create
+              <Activity size={16} />
+              Portfolio
             </button>
-            <button
-              onClick={() => setActiveTab("orders")}
-              className={`flex-1 md:flex-none flex items-center justify-center gap-2 px-4 md:px-6 py-2 text-xs md:text-sm font-medium rounded-lg transition-all whitespace-nowrap ${
-                activeTab === "orders" ? "bg-jet-black text-emerald shadow-sm" : "text-granite hover:text-snow"
-              }`}
-            >
-              <List size={16} />
-              Orders
-            </button>
-            {/* NEW HUNTER TAB */}
             <button
               onClick={() => setActiveTab("hunter")}
-              className={`flex-1 md:flex-none flex items-center justify-center gap-2 px-4 md:px-6 py-2 text-xs md:text-sm font-medium rounded-lg transition-all whitespace-nowrap ${
+              className={`flex-1 md:flex-none flex items-center justify-center gap-2 px-6 py-2 text-sm font-medium rounded-lg transition-all ${
                 activeTab === "hunter" ? "bg-jet-black text-emerald shadow-sm" : "text-granite hover:text-snow"
               }`}
             >
@@ -173,21 +174,17 @@ export default function Home() {
 
         {/* Tab Content */}
         <div className="w-full">
-          {activeTab === "create" && (
-            <div className="max-w-xl mx-auto w-full animate-in fade-in slide-in-from-bottom-2 duration-300">
-              <OrderForm onOrderCreated={handleOrderCreated} />
+          {activeTab === "portfolio" && (
+            <div className="w-full animate-in fade-in duration-300">
+              <div className="bg-onyx border border-shadow-grey rounded-2xl p-6 text-center text-granite">
+                <p className="text-sm">Portfolio details and history will appear here.</p>
+                <p className="text-xs mt-2 text-granite/50">Use the Hunter tab to manage your rebate rules.</p>
+              </div>
             </div>
           )}
 
-          {activeTab === "orders" && (
-            <div className="w-full animate-in fade-in slide-in-from-bottom-2 duration-300">
-              <OrderTable refreshTrigger={refreshTrigger} />
-            </div>
-          )}
-
-          {/* NEW HUNTER CONTENT */}
           {activeTab === "hunter" && (
-            <div className="w-full animate-in fade-in slide-in-from-bottom-2 duration-300">
+            <div className="w-full animate-in fade-in duration-300">
               <HunterDashboard />
             </div>
           )}
@@ -198,30 +195,18 @@ export default function Home() {
       {/* MOBILE BOTTOM NAVBAR */}
       <nav className="md:hidden fixed bottom-0 left-0 w-full bg-onyx border-t border-shadow-grey flex justify-around items-center pt-2 pb-6 z-50">
         <div 
-          onClick={() => setActiveTab("create")}
-          className={`flex flex-col items-center cursor-pointer transition-colors ${activeTab === "create" ? "text-emerald" : "text-granite"}`}
+          onClick={() => setActiveTab("portfolio")}
+          className={`flex flex-col items-center cursor-pointer transition-colors ${activeTab === "portfolio" ? "text-emerald" : "text-granite"}`}
         >
-          <PlusCircle size={20} />
-          <span className="text-[10px] mt-1 font-medium">Create</span>
+          <Activity size={20} />
+          <span className="text-[10px] mt-1 font-medium">Portfolio</span>
         </div>
-        <div 
-          onClick={() => setActiveTab("orders")}
-          className={`flex flex-col items-center cursor-pointer transition-colors ${activeTab === "orders" ? "text-emerald" : "text-granite"}`}
-        >
-          <List size={20} />
-          <span className="text-[10px] mt-1 font-medium">Orders</span>
-        </div>
-        {/* NEW HUNTER ICON */}
         <div 
           onClick={() => setActiveTab("hunter")}
           className={`flex flex-col items-center cursor-pointer transition-colors ${activeTab === "hunter" ? "text-emerald" : "text-granite"}`}
         >
           <Crosshair size={20} />
           <span className="text-[10px] mt-1 font-medium">Hunter</span>
-        </div>
-        <div className="flex flex-col items-center text-granite hover:text-snow cursor-pointer transition-colors">
-          <Wallet size={20} />
-          <span className="text-[10px] mt-1">Wallet</span>
         </div>
       </nav>
 

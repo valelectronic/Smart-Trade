@@ -15,6 +15,7 @@ PORT = int(os.getenv("PORT", 8000))
 
 MONITOR_RETRY_SECONDS = 5
 HUNTER_RETRY_SECONDS = 10
+HUNTER_DAILY_LIMIT_SLEEP = 3600  # 1 hour
 
 
 async def monitor_supervisor():
@@ -36,13 +37,21 @@ async def hunter_supervisor():
     while True:
         try:
             print("[HUNTER] Starting Rebate Hunter.")
-            await run_rebate_hunter()
-            print("[HUNTER] Hunter stopped; restarting shortly.")
+            # run_rebate_hunter returns True if daily limit reached, False otherwise
+            finished_daily_limit = await run_rebate_hunter()
+            
+            if finished_daily_limit:
+                print(f"[HUNTER] Daily limit reached. Sleeping for {HUNTER_DAILY_LIMIT_SLEEP}s.")
+                await asyncio.sleep(HUNTER_DAILY_LIMIT_SLEEP)
+            else:
+                print(f"[HUNTER] Hunter stopped unexpectedly. Retrying in {HUNTER_RETRY_SECONDS}s.")
+                await asyncio.sleep(HUNTER_RETRY_SECONDS)
+                
         except asyncio.CancelledError:
             raise
         except Exception as exc:
             print(f"[HUNTER ERROR] {type(exc).__name__}: {exc}")
-        await asyncio.sleep(HUNTER_RETRY_SECONDS)
+            await asyncio.sleep(HUNTER_RETRY_SECONDS)
 
 
 async def main():
@@ -61,16 +70,16 @@ async def main():
 
     print(f"[API] Starting at http://{HOST}:{PORT}")
     print(f"[API] Documentation: http://{HOST}:{PORT}/docs")
-    print("[SAFETY] API and Monitor running. Hunter executing swaps.")
+    print("[SAFETY] Lean Mode: API and Monitor running. Hunter executing swaps.")
 
-    # Start the API server FIRST
+    # Start the API server FIRST so Railway's health check passes
     server_task = asyncio.create_task(server.serve())
     await asyncio.sleep(2)
 
-    # Start the monitor
+    # Start the monitor (live prices only)
     monitor_task = asyncio.create_task(monitor_supervisor(), name="cantex-monitor")
 
-    # Start the hunter
+    # Start the rebate hunter (strict ping-pong)
     hunter_task = asyncio.create_task(hunter_supervisor(), name="rebate-hunter")
 
     try:

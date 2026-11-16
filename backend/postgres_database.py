@@ -32,9 +32,10 @@ def get_connection():
 
 def init_db():
     """Create all tables if they do not already exist."""
-    with get_connection() as connection:
+    connection = get_connection()
+    try:
         with connection.cursor() as cursor:
-            # 1. Orders table
+            # 1. Orders table (kept for backward compatibility, unused in Lean Mode)
             cursor.execute(
                 """
                 CREATE TABLE IF NOT EXISTS orders (
@@ -82,7 +83,91 @@ def init_db():
                 """
             )
         connection.commit()
+    finally:
+        connection.close()
 
+def get_today_swap_count():
+    """Returns the number of successful swaps executed today."""
+    connection = get_connection()
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT COUNT(*) as count 
+                FROM rebate_swaps 
+                WHERE created_at >= CURRENT_DATE
+                """
+            )
+            row = cursor.fetchone()
+            return row["count"] if row else 0
+    finally:
+        connection.close()
+
+def log_successful_swap(tx_id, pair, sell_token, buy_token, sell_amount, net_fee, pool_fee, usd_value):
+    """Logs a successful swap to the database."""
+    connection = get_connection()
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                INSERT INTO rebate_swaps (
+                    tx_id, pair, sell_token, buy_token, 
+                    sell_amount, network_fee, pool_fee, usd_value
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (tx_id) DO NOTHING
+                """,
+                (
+                    str(tx_id), str(pair), str(sell_token), str(buy_token),
+                    str(sell_amount), str(net_fee), str(pool_fee), str(usd_value)
+                ),
+            )
+        connection.commit()
+    finally:
+        connection.close()
+
+def get_today_fees_spent():
+    """Returns the total network fees spent today in CC."""
+    connection = get_connection()
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT COALESCE(SUM(CAST(network_fee AS DECIMAL)), 0) as total_fees
+                FROM rebate_swaps 
+                WHERE created_at >= CURRENT_DATE
+                """
+            )
+            row = cursor.fetchone()
+            return float(row["total_fees"]) if row else 0.0
+    finally:
+        connection.close()
+
+def delete_hunter_rule(rule_id: int):
+    """Delete a hunter rule by ID."""
+    connection = get_connection()
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute("DELETE FROM hunter_rules WHERE id = %s", (rule_id,))
+            rowcount = cursor.rowcount
+        connection.commit()
+        return rowcount > 0
+    finally:
+        connection.close()
+
+def get_active_hunter_rules():
+    """Returns a list of active hunter rules (tokens only)."""
+    connection = get_connection()
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT token_a, token_b FROM hunter_rules WHERE is_active = TRUE"
+            )
+            return cursor.fetchall()
+    finally:
+        connection.close()
+
+# Legacy order functions (kept for backward compatibility, unused in Lean Mode)
 def add_order(order):
     """Insert an order into PostgreSQL."""
     missing = [
@@ -101,7 +186,8 @@ def add_order(order):
     if not values["id"]:
         raise ValueError("Order id cannot be empty")
 
-    with get_connection() as connection:
+    connection = get_connection()
+    try:
         with connection.cursor() as cursor:
             cursor.execute(
                 """
@@ -114,12 +200,14 @@ def add_order(order):
                 tuple(values[column] for column in ORDER_COLUMNS),
             )
         connection.commit()
-
-    return values
+        return values
+    finally:
+        connection.close()
 
 def get_all_orders():
     """Return every order, ordered by id."""
-    with get_connection() as connection:
+    connection = get_connection()
+    try:
         with connection.cursor() as cursor:
             cursor.execute(
                 """
@@ -131,12 +219,14 @@ def get_all_orders():
                 """
             )
             rows = cursor.fetchall()
-
-    return [dict(row) for row in rows]
+        return [dict(row) for row in rows]
+    finally:
+        connection.close()
 
 def delete_order(order_id):
     """Delete an order by id. Return True if an order was deleted."""
-    with get_connection() as connection:
+    connection = get_connection()
+    try:
         with connection.cursor() as cursor:
             cursor.execute(
                 "DELETE FROM orders WHERE id = %s",
@@ -144,76 +234,6 @@ def delete_order(order_id):
             )
             rowcount = cursor.rowcount
         connection.commit()
-
-    return rowcount > 0
-
-# ==========================================
-# REBATE HUNTER FUNCTIONS
-# ==========================================
-
-def get_today_swap_count():
-    """Returns the number of successful swaps executed today."""
-    with get_connection() as connection:
-        with connection.cursor() as cursor:
-            cursor.execute(
-                """
-                SELECT COUNT(*) as count 
-                FROM rebate_swaps 
-                WHERE created_at >= CURRENT_DATE
-                """
-            )
-            row = cursor.fetchone()
-            
-    return row["count"] if row else 0
-
-def log_successful_swap(tx_id, pair, sell_token, buy_token, sell_amount, net_fee, pool_fee, usd_value):
-    """Logs a successful swap to the database."""
-    with get_connection() as connection:
-        with connection.cursor() as cursor:
-            cursor.execute(
-                """
-                INSERT INTO rebate_swaps (
-                    tx_id, pair, sell_token, buy_token, 
-                    sell_amount, network_fee, pool_fee, usd_value
-                )
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-                ON CONFLICT (tx_id) DO NOTHING
-                """,
-                (
-                    str(tx_id), str(pair), str(sell_token), str(buy_token),
-                    str(sell_amount), str(net_fee), str(pool_fee), str(usd_value)
-                ),
-            )
-        connection.commit()
-
-def get_today_fees_spent():
-    """Returns the total network fees spent today in CC."""
-    with get_connection() as connection:
-        with connection.cursor() as cursor:
-            cursor.execute(
-                """
-                SELECT COALESCE(SUM(CAST(network_fee AS DECIMAL)), 0) as total_fees
-                FROM rebate_swaps 
-                WHERE created_at >= CURRENT_DATE
-                """
-            )
-            row = cursor.fetchone()
-    return float(row["total_fees"]) if row else 0.0
-
-def delete_hunter_rule(rule_id: int):
-    """Delete a hunter rule by ID."""
-    with get_connection() as connection:
-        with connection.cursor() as cursor:
-            cursor.execute("DELETE FROM hunter_rules WHERE id = %s", (rule_id,))
-            rowcount = cursor.rowcount
-        connection.commit()
-    return rowcount > 0
-
-def get_active_hunter_rules():
-    """Returns a list of active hunter rules (tokens only)."""
-    with get_connection() as connection:
-        with connection.cursor() as cursor:
-            cursor.execute(
-                "SELECT token_a, token_b FROM hunter_rules WHERE is_active = TRUE"
-            )
-            return cursor.fetchall()
+        return rowcount > 0
+    finally:
+        connection.close()

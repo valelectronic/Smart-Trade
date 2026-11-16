@@ -50,7 +50,7 @@ export function HunterDashboard() {
   const aRef = useRef<HTMLDivElement>(null);
   const bRef = useRef<HTMLDivElement>(null);
 
-  const apiUrl = "https://smart-trade-production-44e4.up.railway.app";
+  const apiUrl = process.env.NEXT_PUBLIC_API_URL || "https://smart-trade-production-44e4.up.railway.app";
 
   useEffect(() => {
     getBalances().then((data) => {
@@ -107,7 +107,7 @@ export function HunterDashboard() {
     const interval = setInterval(() => {
       fetchStatus();
       if (activeSubTab === "history") fetchHistory();
-    }, 3000); 
+    }, 5000); 
     return () => clearInterval(interval);
   }, [activeSubTab, apiUrl]);
 

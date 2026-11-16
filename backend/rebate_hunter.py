@@ -7,15 +7,16 @@ import os
 from pathlib import Path
 from cantex_api import connect_sdk
 from helpers import get_cc_balance
-from postgres_database import get_today_swap_count, log_successful_swap
+from postgres_database import get_today_swap_count, log_successful_swap, get_connection
 
 def canonical_pair_key(token_a: str, token_b: str) -> str:
-    """Sort so MOD::TRKXDEFI and TRKXDEFI::MOD share the same key."""
     a, b = sorted([token_a, token_b])
     return f"{a}::{b}"
 
 # --- CONFIGURATION ---
-TARGET_SWAP_SIZE_CC = Decimal("101")
+TARGET_SWAP_SIZE_CC = Decimal("100.5")
+MIN_SWAP_SIZE_CC = Decimal("100.0")
+MAX_SWAP_SIZE_CC = Decimal("102.0")
 POOL_MIN = Decimal("0.10")
 POOL_MAX = Decimal("0.17")
 DAILY_LIMIT = 25
@@ -50,12 +51,7 @@ def get_prices_in_cc_and_usd(token_symbol):
         token_cc_raw = prices.get(f"{token_symbol}-CC")
         cc_usd_raw = prices.get("CC-USDC")
 
-        if token_cc_raw is None:
-            print(f"[PRICE] Missing {token_symbol}-CC. Monitor may not be subscribed yet.")
-            return None, None
-
-        if cc_usd_raw is None:
-            print(f"[PRICE] Missing CC-USDC. Cannot calculate.")
+        if token_cc_raw is None or cc_usd_raw is None:
             return None, None
         
         token_cc_price = Decimal(str(token_cc_raw))
@@ -67,7 +63,7 @@ def get_prices_in_cc_and_usd(token_symbol):
     except Exception:
         return None, None
 
-async def check_and_swap(client, instruments, sell_token, buy_token, net_min, net_max):
+async def check_and_swap(client, instruments, sell_token, buy_token, net_min, net_max, sell_amount_tokens):
     global swaps_done
     
     if swaps_done >= DAILY_LIMIT:
@@ -83,7 +79,6 @@ async def check_and_swap(client, instruments, sell_token, buy_token, net_min, ne
     if not cc_price or cc_price <= 0:
         return False
 
-    sell_amount_tokens = (TARGET_SWAP_SIZE_CC / cc_price).quantize(Decimal("0.0001"))
     total_usd_value = sell_amount_tokens * usd_price
 
     current_balance = Decimal("0")
@@ -95,7 +90,7 @@ async def check_and_swap(client, instruments, sell_token, buy_token, net_min, ne
             break
 
     if current_balance < sell_amount_tokens:
-        print(f" Not enough {sell_token} to swap. Have: {current_balance}, Need: {sell_amount_tokens}. Skipping.")
+        print(f" Not enough {sell_token}. Have: {current_balance}, Need: {sell_amount_tokens}. Skipping.")
         return False
 
     try:
@@ -107,7 +102,7 @@ async def check_and_swap(client, instruments, sell_token, buy_token, net_min, ne
     except Exception as e:
         error_str = str(e)
         if "429" in error_str or "Too Many Requests" in error_str or "rate limit" in error_str.lower():
-            print(f" RATE LIMIT HIT. Cooling down for 30 seconds to protect account...")
+            print(f" RATE LIMIT HIT. Cooling down for 30 seconds...")
             await asyncio.sleep(30) 
             return False
         else:
@@ -138,7 +133,7 @@ async def check_and_swap(client, instruments, sell_token, buy_token, net_min, ne
         "net_fee": float(network_fee),
         "pool_fee": float(pool_fee_percent),
         "usd_value": float(total_usd_value),
-        "cc_size": float(TARGET_SWAP_SIZE_CC),
+        "cc_size": float(sell_amount_tokens * cc_price),
         "sdk_est_time": sdk_est_time,
         "status": " MET" if (network_ok and pool_ok) else " WAITING",
         "swaps_done": swaps_done
@@ -147,7 +142,7 @@ async def check_and_swap(client, instruments, sell_token, buy_token, net_min, ne
     if network_ok and pool_ok:
         async with execution_lock:
             print(f" CONDITIONS MET! Locking execution queue...")
-            print(f" Details: {sell_amount_tokens} {sell_token} (~${total_usd_value:.2f} USD, {TARGET_SWAP_SIZE_CC} CC)")
+            print(f" Details: {sell_amount_tokens} {sell_token} (~${total_usd_value:.2f} USD, {(sell_amount_tokens * cc_price):.2f} CC)")
             
             start_time = time.perf_counter()
             try:
@@ -183,8 +178,8 @@ async def check_and_swap(client, instruments, sell_token, buy_token, net_min, ne
                 pair_key = canonical_pair_key(sell_token, buy_token)
                 _last_swap_direction[pair_key] = "A_TO_B" if sell_token < buy_token else "B_TO_A"
                 
-                _net_cc_delta[sell_token] = _net_cc_delta.get(sell_token, Decimal("0")) - TARGET_SWAP_SIZE_CC
-                _net_cc_delta[buy_token] = _net_cc_delta.get(buy_token, Decimal("0")) + TARGET_SWAP_SIZE_CC
+                _net_cc_delta[sell_token] = _net_cc_delta.get(sell_token, Decimal("0")) - (sell_amount_tokens * cc_price)
+                _net_cc_delta[buy_token] = _net_cc_delta.get(buy_token, Decimal("0")) + (sell_amount_tokens * cc_price)
                 
                 await asyncio.sleep(POST_SWAP_COOLDOWN) 
                 return True
@@ -196,14 +191,30 @@ async def check_and_swap(client, instruments, sell_token, buy_token, net_min, ne
 
 async def main():
     global swaps_done
-    print(" Starting Rebate Hunter (Adaptive Rule Engine)...")
+    print(" Starting Rebate Hunter (Dynamic 100-102 CC + Strict Ping-Pong)...")
     
     swaps_done = get_today_swap_count()
     print(f" Today's swaps already completed: {swaps_done}/{DAILY_LIMIT}")
     
     if swaps_done >= DAILY_LIMIT:
         print(" Daily limit already reached. Bot will sleep.")
-        return
+        return True
+
+    # --- RESTORE PING-PONG MEMORY FROM DB ---
+    try:
+        conn = get_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT sell_token, buy_token FROM rebate_swaps ORDER BY created_at DESC LIMIT 1")
+                last_swap = cur.fetchone()
+                if last_swap:
+                    pair_key = canonical_pair_key(last_swap["sell_token"], last_swap["buy_token"])
+                    _last_swap_direction[pair_key] = "A_TO_B" if last_swap["sell_token"] < last_swap["buy_token"] else "B_TO_A"
+                    print(f" Restored memory: Last swap was {last_swap['sell_token']} -> {last_swap['buy_token']}")
+        finally:
+            conn.close()
+    except Exception as e:
+        print(f" Could not restore ping-pong memory: {e}")
 
     print(" Fetching active hunter rules from database...")
     TOKEN_PAIRS = []
@@ -216,14 +227,14 @@ async def main():
             print(f" Loaded {len(TOKEN_PAIRS)} rules: {TOKEN_PAIRS}")
         else:
             print(f" API Error: {res.status_code}")
-            return
+            return False
     except Exception as e:
-        print(f" Failed to connect to API to fetch rules: {e}")
-        return
+        print(f" Failed to connect to API: {e}")
+        return False
         
     if not TOKEN_PAIRS:
-        print(" No active rules found in database. Add rules in the UI first. Exiting.")
-        return
+        print(" No active rules found. Exiting.")
+        return False
 
     client = await connect_sdk()
     
@@ -268,33 +279,43 @@ async def main():
                 if not a_price_cc or not b_price_cc:
                     continue
 
-                # BUG 3 FIX: Quantize to match check_and_swap's precision
-                req_a = (TARGET_SWAP_SIZE_CC / a_price_cc).quantize(Decimal("0.0001"))
-                req_b = (TARGET_SWAP_SIZE_CC / b_price_cc).quantize(Decimal("0.0001"))
-
+                # --- STRICT PING-PONG & 100-102 CC BOUNDS ---
                 last_dir = _last_swap_direction.get(pair_key)
                 
+                forced_dir = None
+                if last_dir == "A_TO_B":
+                    forced_dir = "B_TO_A"
+                elif last_dir == "B_TO_A":
+                    forced_dir = "A_TO_B"
+
                 possible_directions = []
                 
-                if balance_a >= req_a:
-                    possible_directions.append({"sell": token_a, "buy": token_b, "amount": req_a, "dir": "A_TO_B"})
-                if balance_b >= req_b:
-                    possible_directions.append({"sell": token_b, "buy": token_a, "amount": req_b, "dir": "B_TO_A"})
-                
+                if forced_dir == "A_TO_B" or (forced_dir is None and (balance_a * a_price_cc) >= MIN_SWAP_SIZE_CC):
+                    amount_to_sell = balance_a
+                    if (amount_to_sell * a_price_cc) > MAX_SWAP_SIZE_CC:
+                        amount_to_sell = (MAX_SWAP_SIZE_CC / a_price_cc).quantize(Decimal("0.0001"))
+                    
+                    if (amount_to_sell * a_price_cc) >= MIN_SWAP_SIZE_CC:
+                        possible_directions.append({"sell": token_a, "buy": token_b, "amount": amount_to_sell, "dir": "A_TO_B"})
+                        
+                elif forced_dir == "B_TO_A" or (forced_dir is None and (balance_b * b_price_cc) >= MIN_SWAP_SIZE_CC):
+                    amount_to_sell = balance_b
+                    if (amount_to_sell * b_price_cc) > MAX_SWAP_SIZE_CC:
+                        amount_to_sell = (MAX_SWAP_SIZE_CC / b_price_cc).quantize(Decimal("0.0001"))
+                        
+                    if (amount_to_sell * b_price_cc) >= MIN_SWAP_SIZE_CC:
+                        possible_directions.append({"sell": token_b, "buy": token_a, "amount": amount_to_sell, "dir": "B_TO_A"})
+
                 if not possible_directions:
                     continue
-
-                if last_dir == "A_TO_B":
-                    possible_directions.sort(key=lambda x: 0 if x["dir"] == "B_TO_A" else 1)
-                else:
-                    possible_directions.sort(key=lambda x: 0 if x["dir"] == "A_TO_B" else 1)
 
                 for direction in possible_directions:
                     sell = direction["sell"]
                     buy = direction["buy"]
                     req_sell = direction["amount"]
+                    req_cc = req_sell * (a_price_cc if sell == token_a else b_price_cc)
                     
-                    if _net_cc_delta.get(buy, Decimal("0")) + TARGET_SWAP_SIZE_CC > Decimal("200"):
+                    if _net_cc_delta.get(buy, Decimal("0")) + req_cc > Decimal("200"):
                         print(f" [STACK GUARD] Skipping {sell}->{buy}. Too much {buy} stacked.")
                         continue
 
@@ -329,7 +350,12 @@ async def main():
 
             if best_opportunity:
                 print(f" Best fee found: {lowest_fee} CC for {best_opportunity['sell']} -> {best_opportunity['buy']}")
-                executed = await check_and_swap(client, instruments, best_opportunity["sell"], best_opportunity["buy"], best_opportunity["net_min"], best_opportunity["net_max"])
+                executed = await check_and_swap(
+                    client, instruments, 
+                    best_opportunity["sell"], best_opportunity["buy"], 
+                    best_opportunity["net_min"], best_opportunity["net_max"],
+                    best_opportunity["amount"]
+                )
                 if not executed:
                     await asyncio.sleep(2)
                     save_status({
@@ -338,13 +364,13 @@ async def main():
                         "net_fee": 0,
                         "pool_fee": 0,
                         "usd_value": 0,
-                        "cc_size": float(TARGET_SWAP_SIZE_CC),
+                        "cc_size": 0,
                         "sdk_est_time": 0,
                         "status": " WAITING",
                         "swaps_done": swaps_done
                     })
+                    await asyncio.sleep(RED_LIGHT_WAIT)
             else:
-                # No green fees this cycle — must pause, or the loop spins with no sleep
                 print(f" No green fees found. Waiting {RED_LIGHT_WAIT}s...")
                 save_status({
                     "time": time.strftime("%H:%M:%S"),
@@ -352,7 +378,7 @@ async def main():
                     "net_fee": 0,
                     "pool_fee": 0,
                     "usd_value": 0,
-                    "cc_size": float(TARGET_SWAP_SIZE_CC),
+                    "cc_size": 0,
                     "sdk_est_time": 0,
                     "status": " WAITING",
                     "swaps_done": swaps_done
@@ -368,6 +394,7 @@ async def main():
             if asyncio.iscoroutine(result):
                 await result
         print("Connection closed.")
+    return False
 
 if __name__ == "__main__":
     asyncio.run(main())
