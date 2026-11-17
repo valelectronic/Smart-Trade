@@ -14,7 +14,7 @@ def canonical_pair_key(token_a: str, token_b: str) -> str:
     return f"{a}::{b}"
 
 # --- CONFIGURATION ---
-TARGET_SWAP_SIZE_CC = Decimal("100.5")
+TARGET_SWAP_SIZE_CC = Decimal("101.0")
 MIN_SWAP_SIZE_CC = Decimal("100.0")
 MAX_SWAP_SIZE_CC = Decimal("102.0")
 POOL_MIN = Decimal("0.10")
@@ -64,7 +64,7 @@ def get_prices_in_cc_and_usd(token_symbol):
     except Exception:
         return None, None
 
-async def check_and_swap(client, instruments, sell_token, buy_token, net_min, net_max, sell_amount_tokens):
+async def check_and_swap(client, instruments, sell_token, buy_token, net_min, net_max, sell_amount_tokens, pair_key=None, direction=None):
     global swaps_done, swap_halted
     
     if swaps_done >= DAILY_LIMIT:
@@ -181,8 +181,10 @@ async def check_and_swap(client, instruments, sell_token, buy_token, net_min, ne
                 swaps_done += 1
                 print(f" Logged swap to database. Total today: {swaps_done}/{DAILY_LIMIT}")
                 
-                pair_key = canonical_pair_key(sell_token, buy_token)
-                _last_swap_direction[pair_key] = "A_TO_B" if sell_token < buy_token else "B_TO_A"
+                if pair_key and direction:
+                    _last_swap_direction[pair_key] = direction
+                else:
+                    _last_swap_direction[canonical_pair_key(sell_token, buy_token)] = "A_TO_B"
                 
                 _net_cc_delta[sell_token] = _net_cc_delta.get(sell_token, Decimal("0")) - (sell_amount_tokens * cc_price)
                 _net_cc_delta[buy_token] = _net_cc_delta.get(buy_token, Decimal("0")) + (sell_amount_tokens * cc_price)
@@ -319,6 +321,8 @@ async def main():
                 for item in getattr(account, "tokens", []) or []:
                     symbol = getattr(item, "instrument_symbol", None)
                     unlocked = getattr(item, "unlocked_amount", None)
+                    # DIAGNOSTIC: show every token Cantex returns
+
                     if symbol and str(symbol).upper() == token_a:
                         balance_a = Decimal(str(unlocked))
                     if symbol and str(symbol).upper() == token_b:
@@ -327,12 +331,13 @@ async def main():
                 a_price_cc, _ = get_prices_in_cc_and_usd(token_a)
                 b_price_cc, _ = get_prices_in_cc_and_usd(token_b)
                 
+                
                 if not a_price_cc or not b_price_cc:
                     continue
 
-                # --- STRICT PING-PONG & 100-102 CC BOUNDS ---
+                 # --- PING-PONG WITH FALLBACK (no hardcoding, honors DB order) ---
                 last_dir = _last_swap_direction.get(pair_key)
-                
+
                 forced_dir = None
                 if last_dir == "A_TO_B":
                     forced_dir = "B_TO_A"
@@ -340,24 +345,46 @@ async def main():
                     forced_dir = "A_TO_B"
 
                 possible_directions = []
-                
-                if forced_dir == "A_TO_B" or (forced_dir is None and (balance_a * a_price_cc) >= MIN_SWAP_SIZE_CC):
-                    amount_to_sell = balance_a
-                    if (amount_to_sell * a_price_cc) > MAX_SWAP_SIZE_CC:
-                        amount_to_sell = (MAX_SWAP_SIZE_CC / a_price_cc).quantize(Decimal("0.0001"))
-                    
-                    if (amount_to_sell * a_price_cc) >= MIN_SWAP_SIZE_CC:
-                        possible_directions.append({"sell": token_a, "buy": token_b, "amount": amount_to_sell, "dir": "A_TO_B"})
-                        
-                elif forced_dir == "B_TO_A" or (forced_dir is None and (balance_b * b_price_cc) >= MIN_SWAP_SIZE_CC):
-                    amount_to_sell = balance_b
-                    if (amount_to_sell * b_price_cc) > MAX_SWAP_SIZE_CC:
-                        amount_to_sell = (MAX_SWAP_SIZE_CC / b_price_cc).quantize(Decimal("0.0001"))
-                        
-                    if (amount_to_sell * b_price_cc) >= MIN_SWAP_SIZE_CC:
-                        possible_directions.append({"sell": token_b, "buy": token_a, "amount": amount_to_sell, "dir": "B_TO_A"})
+
+                def try_direction(sell_tok, buy_tok, sell_bal, sell_price):
+                    """Helper: adds a direction to possible_directions if balance ≥ MIN_SWAP_SIZE_CC."""
+                    if sell_price is None or sell_price <= 0:
+                        return
+                    if (sell_bal * sell_price) < MIN_SWAP_SIZE_CC:
+                        return
+                    amount_to_sell = sell_bal
+                    if (amount_to_sell * sell_price) > MAX_SWAP_SIZE_CC:
+                        amount_to_sell = (MAX_SWAP_SIZE_CC / sell_price).quantize(Decimal("0.0001"))
+                    if (amount_to_sell * sell_price) < MIN_SWAP_SIZE_CC:
+                        return
+                    dir_label = "A_TO_B" if sell_tok == token_a else "B_TO_A"
+                    possible_directions.append({
+                        "sell": sell_tok,
+                        "buy": buy_tok,
+                        "amount": amount_to_sell,
+                        "dir": dir_label,
+                    })
+
+                # 1. Try the forced (reverse of last swap) direction first
+                if forced_dir == "A_TO_B":
+                    try_direction(token_a, token_b, balance_a, a_price_cc)
+                elif forced_dir == "B_TO_A":
+                    try_direction(token_b, token_a, balance_b, b_price_cc)
+                else:
+                    # No history — try A→B first, then B→A
+                    try_direction(token_a, token_b, balance_a, a_price_cc)
+                    if not possible_directions:
+                        try_direction(token_b, token_a, balance_b, b_price_cc)
+
+                # 2. Fallback: if the forced direction had no balance, try the opposite
+                if not possible_directions and forced_dir:
+                    if forced_dir == "A_TO_B":
+                        try_direction(token_b, token_a, balance_b, b_price_cc)
+                    else:
+                        try_direction(token_a, token_b, balance_a, a_price_cc)
 
                 if not possible_directions:
+                    print(f"[SKIP] {token_a}/{token_b} — neither direction has ≥{MIN_SWAP_SIZE_CC} CC balance")
                     continue
 
                 for direction in possible_directions:
@@ -409,7 +436,9 @@ async def main():
                     client, instruments, 
                     best_opportunity["sell"], best_opportunity["buy"], 
                     best_opportunity["net_min"], best_opportunity["net_max"],
-                    best_opportunity["amount"]
+                    best_opportunity["amount"],
+                    pair_key=canonical_pair_key(best_opportunity["sell"], best_opportunity["buy"]),
+                    direction=best_opportunity["dir"]
                 )
                 if not executed:
                     await asyncio.sleep(2)
