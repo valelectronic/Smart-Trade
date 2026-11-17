@@ -170,11 +170,14 @@ def save_hunter_rule(rule: HunterRuleCreate):
     try:
         with connection.cursor() as cur:
             cur.execute(
-                "UPDATE hunter_rules SET is_active = FALSE WHERE token_a = %s AND token_b = %s",
-                (rule.token_a.upper(), rule.token_b.upper())
-            )
-            cur.execute(
-                "INSERT INTO hunter_rules (token_a, token_b, net_min, net_max) VALUES (%s, %s, %s, %s)",
+                """
+                INSERT INTO hunter_rules (token_a, token_b, net_min, net_max, is_active)
+                VALUES (%s, %s, %s, %s, TRUE)
+                ON CONFLICT (token_a, token_b)
+                DO UPDATE SET net_min = EXCLUDED.net_min,
+                              net_max = EXCLUDED.net_max,
+                              is_active = TRUE
+                """,
                 (rule.token_a.upper(), rule.token_b.upper(), rule.net_min, rule.net_max)
             )
         connection.commit()
@@ -238,30 +241,36 @@ def get_market_prices():
 
 @app.get("/api/all-tokens")
 def get_all_tokens():
-    """Returns all tradeable tokens on Cantex with a 10-minute cache."""
     global _all_tokens_cache
     now = time.time()
-    
-    if now - _all_tokens_cache["timestamp"] < 600:  # 10 minutes
+
+    if now - _all_tokens_cache["timestamp"] < 600:
         return _all_tokens_cache["tokens"]
-    
+
     try:
         response = requests.get(f"{PUBLIC_BASE}/markets/info", timeout=10)
         response.raise_for_status()
         markets = response.json().get("data", {}).get("markets", [])
-        
+
         tokens = set()
         for m in markets:
             symbol = m.get("symbol", "")
-            parts = symbol.split("-")
-            if len(parts) == 2:
-                tokens.add(parts[0].upper())
-                tokens.add(parts[1].upper())
-        
+            if "-" not in symbol:
+                continue
+            # Split from the RIGHT: last part is quote currency, rest is base token.
+            # "TF-USDT-CC" -> base="TF-USDT", quote="CC"
+            # "MOD-CC"     -> base="MOD",     quote="CC"
+            # "BTC-CC"     -> base="BTC",     quote="CC"
+            base, _, quote = symbol.rpartition("-")
+            if base:
+                tokens.add(base.upper())
+            if quote:
+                tokens.add(quote.upper())
+
         tokens.discard("CC")
         tokens.discard("USDC")
         tokens.discard("USDCX")
-        
+
         result = sorted(list(tokens))
         _all_tokens_cache = {"tokens": result, "timestamp": now}
         return result
