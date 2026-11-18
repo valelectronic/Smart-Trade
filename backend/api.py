@@ -279,6 +279,45 @@ def get_market_prices():
         "status": "success"
     }
 
+
+@app.get("/api/hunter-daily-stats")
+def get_daily_stats():
+    connection = get_connection()
+    try:
+        with connection.cursor() as cur:
+            cur.execute(
+                """
+                SELECT sell_amount, network_fee, pool_fee, usd_value
+                FROM rebate_swaps
+                WHERE created_at >= CURRENT_DATE
+                """
+            )
+            swaps = cur.fetchall()
+
+            total_net_fee = 0.0
+            total_pool_fee_cc = 0.0
+            swap_count = len(swaps)
+
+            for s in swaps:
+                total_net_fee += float(s["network_fee"])
+                total_pool_fee_cc += float(s["sell_amount"]) * (float(s["pool_fee"]) / 100)
+
+            estimated_rebate_cc = 23.4 * (swap_count / 25.0)
+            net_profit_cc = estimated_rebate_cc - total_net_fee - total_pool_fee_cc
+
+            return {
+                "status": "success",
+                "swap_count": swap_count,
+                "total_net_fee": total_net_fee,
+                "total_pool_fee_cc": total_pool_fee_cc,
+                "estimated_rebate_cc": estimated_rebate_cc,
+                "net_profit_cc": net_profit_cc,
+            }
+    except Exception as e:
+        return {"status": "error", "detail": str(e)}
+    finally:
+        connection.close()
+
 @app.get("/api/all-tokens")
 def get_all_tokens():
     global _all_tokens_cache
