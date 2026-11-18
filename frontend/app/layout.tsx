@@ -2,6 +2,7 @@ import type { Metadata } from "next";
 import { GeistSans } from "geist/font/sans";
 import { Toaster } from "sonner";
 import "./globals.css";
+import { ErrorBoundary } from "@/components/ErrorBoundary";
 
 export const metadata: Metadata = {
   title: "Cantex Terminal",
@@ -15,8 +16,10 @@ export default function RootLayout({
 }) {
   return (
     <html lang="en" suppressHydrationWarning>
-      <body className={`${GeistSans.className} bg-onyx-dark text-snow antialiased min-h-screen pb-16 md:pb-0`}>
-        {children}
+            <body className={`${GeistSans.className} bg-onyx-dark text-snow antialiased min-h-screen pb-16 md:pb-0`}>
+        <ErrorBoundary>
+          {children}
+        </ErrorBoundary>
         <Toaster theme="dark" position="bottom-right" richColors />
       </body>
     </html>

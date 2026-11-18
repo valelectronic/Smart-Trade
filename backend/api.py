@@ -3,6 +3,7 @@
 import asyncio
 import json
 import time
+import os
 import requests  # <-- ADDED
 from pathlib import Path
 from contextlib import asynccontextmanager
@@ -23,8 +24,12 @@ from postgres_database import (
 
 # --- All Tokens Cache ---
 _all_tokens_cache = {"tokens": [], "timestamp": 0}
+# --- Fees cache (protects Neon from 10s frontend polling) ---
+_fees_cache = {"data": {}, "timestamp": 0}
+# --- Kill switch file ---
+PAUSE_FILE = Path(__file__).parent / "bot_control.json"
 
-# ... (the rest of your api.py stays exactly the same) ...
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -56,6 +61,9 @@ class HunterRuleCreate(BaseModel):
     token_b: str
     net_min: str
     net_max: str
+
+class PauseRequest(BaseModel):
+        paused: bool
 
 
 @app.get("/api/health")
@@ -119,6 +127,28 @@ async def get_portfolio_value():
         return {"total_usd": str(total_usd), "breakdown": breakdown, "status": "success"}
     except Exception as e:
         return {"error": str(e), "status": "failed"}
+
+
+@app.post("/api/hunter-pause")
+def set_pause_state(req: PauseRequest):
+    try:
+        tmp = PAUSE_FILE.with_suffix(".tmp")
+        with tmp.open("w") as f:
+            json.dump({"paused": req.paused}, f)
+        os.replace(tmp, PAUSE_FILE)  # atomic — bot never reads a half-written file
+        return {"status": "success", "paused": req.paused}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/hunter-pause")
+def get_pause_state():
+    if PAUSE_FILE.exists():
+        try:
+            with PAUSE_FILE.open("r") as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {"paused": False}
 
 @app.get("/api/balances")
 async def get_balances():
@@ -197,9 +227,19 @@ def remove_hunter_rule(rule_id: int):
 
 @app.get("/api/hunter-fees")
 def get_fees_spent():
+    global _fees_cache
+    now = time.time()
+
+    # Serve from cache for 30s — the frontend polls every 10s,
+    # so without this we'd hit Neon 6x more than necessary.
+    if now - _fees_cache["timestamp"] < 30 and _fees_cache["data"]:
+        return _fees_cache["data"]
+
     try:
         total = get_today_fees_spent()
-        return {"total_fees_cc": total, "status": "success"}
+        data = {"total_fees_cc": total, "status": "success"}
+        _fees_cache = {"data": data, "timestamp": now}
+        return data
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 

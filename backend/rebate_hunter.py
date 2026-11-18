@@ -8,6 +8,7 @@ from pathlib import Path
 from cantex_api import connect_sdk
 from helpers import get_cc_balance
 from postgres_database import get_today_swap_count, log_successful_swap, get_connection
+from datetime import datetime, timezone, timedelta
 
 def canonical_pair_key(token_a: str, token_b: str) -> str:
     a, b = sorted([token_a, token_b])
@@ -66,6 +67,7 @@ def get_prices_in_cc_and_usd(token_symbol):
 
 async def check_and_swap(client, instruments, sell_token, buy_token, net_min, net_max, sell_amount_tokens, pair_key=None, direction=None):
     global swaps_done, swap_halted
+    
     
     if swaps_done >= DAILY_LIMIT:
         return False
@@ -160,7 +162,7 @@ async def check_and_swap(client, instruments, sell_token, buy_token, net_min, ne
                 if not result or not result.get("verify"):
                     print(f" PARTIAL SWAP DETECTED. Halting for manual review.")
                     swap_halted = True
-                    return False
+                    return "HALTED_PARTIAL_SWAP"
 
                 end_time = time.perf_counter()
                 exec_time = end_time - start_time
@@ -228,15 +230,19 @@ async def fetch_active_hunter_rules():
         return None
 
 async def main():
-    global swaps_done
+    global swaps_done, swap_halted
+    swap_halted = False 
     print(" Starting Rebate Hunter (Dynamic 100-102 CC + Strict Ping-Pong)...")
     
     swaps_done = get_today_swap_count()
     print(f" Today's swaps already completed: {swaps_done}/{DAILY_LIMIT}")
     
     if swaps_done >= DAILY_LIMIT:
-        print(" Daily limit already reached. Bot will sleep.")
-        return True
+        now = datetime.now(timezone.utc)
+        next_midnight_utc = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+        seconds_until_next_run = int((next_midnight_utc - now).total_seconds())
+        print(f" Daily limit reached ({swaps_done}/{DAILY_LIMIT}). Sleeping {seconds_until_next_run}s until UTC midnight.")
+        return f"DAILY_LIMIT_SLEEP:{seconds_until_next_run}"
 
     # --- RESTORE PING-PONG MEMORY FROM DB ---
     try:
