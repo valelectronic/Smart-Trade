@@ -15,7 +15,7 @@ def canonical_pair_key(token_a: str, token_b: str) -> str:
     return f"{a}::{b}"
 
 # --- CONFIGURATION ---
-TARGET_SWAP_SIZE_CC = Decimal("101.0")
+TARGET_SWAP_SIZE_CC = Decimal("101.5")
 MIN_SWAP_SIZE_CC = Decimal("100.0")
 MAX_SWAP_SIZE_CC = Decimal("102.0")
 POOL_MIN = Decimal("0.10")
@@ -168,18 +168,24 @@ async def check_and_swap(client, instruments, sell_token, buy_token, net_min, ne
                 exec_time = end_time - start_time
                 tx_id = result.get('id')
                 print(f" SWAP SUCCESS in {exec_time:.2f}s! TX ID: {tx_id}")
-                
-                log_successful_swap(
-                    tx_id=tx_id,
-                    pair=f"{sell_token}->{buy_token}",
-                    sell_token=sell_token,
-                    buy_token=buy_token,
-                    sell_amount=float(sell_amount_tokens),
-                    net_fee=float(network_fee),
-                    pool_fee=float(pool_fee_percent),
-                    usd_value=float(total_usd_value)
-                )
-                
+
+                # Log to DB, but don't let a DB failure block the swap count.
+                # The swap is already on-chain — Cantex will count it. If the DB
+                # write fails, we must still increment swaps_done to avoid drift.
+                try:
+                    log_successful_swap(
+                        tx_id=tx_id,
+                        pair=f"{sell_token}->{buy_token}",
+                        sell_token=sell_token,
+                        buy_token=buy_token,
+                        sell_amount=float(sell_amount_tokens),
+                        net_fee=float(network_fee),
+                        pool_fee=float(pool_fee_percent),
+                        usd_value=float(total_usd_value)
+                    )
+                except Exception as db_err:
+                    print(f" [DB ERROR] Swap succeeded but log failed: {db_err}. Incrementing count anyway.")
+
                 swaps_done += 1
                 print(f" Logged swap to database. Total today: {swaps_done}/{DAILY_LIMIT}")
                 
@@ -353,16 +359,25 @@ async def main():
                 possible_directions = []
 
                 def try_direction(sell_tok, buy_tok, sell_bal, sell_price):
-                    """Helper: adds a direction to possible_directions if balance ≥ MIN_SWAP_SIZE_CC."""
+                    """Helper: adds a direction to possible_directions if balance ≥ MIN_SWAP_SIZE_CC.
+                    Targets TARGET_SWAP_SIZE_CC, capped at MAX, floored at MIN."""
                     if sell_price is None or sell_price <= 0:
                         return
                     if (sell_bal * sell_price) < MIN_SWAP_SIZE_CC:
                         return
-                    amount_to_sell = sell_bal
+
+                    # Target 101.5 CC worth of tokens, but never sell more than we have
+                    target_amount = TARGET_SWAP_SIZE_CC / sell_price
+                    amount_to_sell = min(sell_bal, target_amount)
+
+                    # Hard cap at MAX (capital ceiling)
                     if (amount_to_sell * sell_price) > MAX_SWAP_SIZE_CC:
                         amount_to_sell = (MAX_SWAP_SIZE_CC / sell_price).quantize(Decimal("0.0001"))
+
+                    # Hard floor at MIN (rebate eligibility)
                     if (amount_to_sell * sell_price) < MIN_SWAP_SIZE_CC:
                         return
+
                     dir_label = "A_TO_B" if sell_tok == token_a else "B_TO_A"
                     possible_directions.append({
                         "sell": sell_tok,
@@ -382,12 +397,9 @@ async def main():
                     if not possible_directions:
                         try_direction(token_b, token_a, balance_b, b_price_cc)
 
-                # 2. Fallback: if the forced direction had no balance, try the opposite
-                if not possible_directions and forced_dir:
-                    if forced_dir == "A_TO_B":
-                        try_direction(token_b, token_a, balance_b, b_price_cc)
-                    else:
-                        try_direction(token_a, token_b, balance_a, a_price_cc)
+                # 2. NO FALLBACK. If the forced direction has no balance, skip the pair.
+                # Doing the same direction as the last swap creates a double-forward,
+                # which loses round-trip rebate eligibility. Wait for the balance instead.
 
                 if not possible_directions:
                     print(f"[SKIP] {token_a}/{token_b} — neither direction has ≥{MIN_SWAP_SIZE_CC} CC balance")
@@ -399,7 +411,10 @@ async def main():
                     req_sell = direction["amount"]
                     req_cc = req_sell * (a_price_cc if sell == token_a else b_price_cc)
                     
-                    if _net_cc_delta.get(buy, Decimal("0")) + req_cc > Decimal("200"):
+                     # Stack guard protects against over-accumulation over many swaps.
+                    # For the last 3 swaps of the day, bypass it — the marginal
+                    # accumulation is negligible and we don't want to miss a rebate.
+                    if swaps_done < 22 and _net_cc_delta.get(buy, Decimal("0")) + req_cc > Decimal("200"):
                         print(f" [STACK GUARD] Skipping {sell}->{buy}. Too much {buy} stacked.")
                         continue
 
