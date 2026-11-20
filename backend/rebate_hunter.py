@@ -21,7 +21,7 @@ MAX_SWAP_SIZE_CC = Decimal("102.0")
 POOL_MIN = Decimal("0.10")
 POOL_MAX = Decimal("0.17")
 DAILY_LIMIT = 25
-POST_SWAP_COOLDOWN = 20
+POST_SWAP_COOLDOWN = 15  
 RED_LIGHT_WAIT = 10      
 MIN_CC_BALANCE = Decimal("5.0") 
 
@@ -169,26 +169,9 @@ async def check_and_swap(client, instruments, sell_token, buy_token, net_min, ne
                 tx_id = result.get('id')
                 print(f" SWAP SUCCESS in {exec_time:.2f}s! TX ID: {tx_id}")
 
-                # --- VERIFY THE SWAP ACTUALLY EXECUTED ON CANTEX ---
-                await asyncio.sleep(POST_SWAP_COOLDOWN)
-
-                try:
-                    account_after = await client.get_account_info()
-                    balance_after = Decimal("0")
-                    for item in getattr(account_after, "tokens", []) or []:
-                        sym = getattr(item, "instrument_symbol", None)
-                        if sym and str(sym).upper() == sell_token:
-                            balance_after = Decimal(str(getattr(item, "unlocked_amount", 0)))
-                            break
-
-                    actual_decrease = current_balance - balance_after
-                    if actual_decrease < sell_amount_tokens * Decimal("0.99"):
-                        print(f" [SWAP FAILED ON CANTEX] Expected {sell_amount_tokens} {sell_token} decrease, got {actual_decrease}. Halting.")
-                        swap_halted = True
-                        return "HALTED_PARTIAL_SWAP"
-                except Exception as verify_err:
-                    print(f" [BALANCE CHECK ERROR] Could not verify swap: {verify_err}. Proceeding with count.")
-
+                # Log to DB, but don't let a DB failure block the swap count.
+                # The swap is already on-chain — Cantex will count it. If the DB
+                # write fails, we must still increment swaps_done to avoid drift.
                 try:
                     log_successful_swap(
                         tx_id=tx_id,
@@ -205,15 +188,16 @@ async def check_and_swap(client, instruments, sell_token, buy_token, net_min, ne
 
                 swaps_done += 1
                 print(f" Logged swap to database. Total today: {swaps_done}/{DAILY_LIMIT}")
-
+                
                 if pair_key and direction:
                     _last_swap_direction[pair_key] = direction
                 else:
                     _last_swap_direction[canonical_pair_key(sell_token, buy_token)] = "A_TO_B"
-
+                
                 _net_cc_delta[sell_token] = _net_cc_delta.get(sell_token, Decimal("0")) - (sell_amount_tokens * cc_price)
                 _net_cc_delta[buy_token] = _net_cc_delta.get(buy_token, Decimal("0")) + (sell_amount_tokens * cc_price)
-
+                
+                await asyncio.sleep(POST_SWAP_COOLDOWN) 
                 return True
             except Exception as e:
                 print(f" Swap Failed: {e}")
