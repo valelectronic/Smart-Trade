@@ -7,7 +7,7 @@ import os
 from pathlib import Path
 from cantex_api import connect_sdk
 from helpers import get_cc_balance
-from postgres_database import get_today_swap_count, log_successful_swap, get_connection
+from postgres_database import (get_today_swap_count, log_successful_swap, get_connection, get_hunter_control_state, activate_manual_intervention_lock)
 from datetime import datetime, timezone, timedelta
 
 def canonical_pair_key(token_a: str, token_b: str) -> str:
@@ -86,7 +86,25 @@ swap_halted = False
 execution_lock = asyncio.Lock() 
 _last_swap_direction = {} 
 _disabled_pairs = {} 
-_net_cc_delta = {} 
+_net_cc_delta = {}
+
+def _allowance_remaining():
+    state = get_hunter_control_state()
+    if not state:
+        raise RuntimeError("Hunter control state is unavailable")
+    remaining = int(state.get("swaps_remaining", DAILY_LIMIT))
+    return max(0, min(DAILY_LIMIT, remaining)), state
+
+
+def _activate_manual_lock(reason: str, tx_id=None):
+    global swap_halted
+    swap_halted = True
+    try:
+        activate_manual_intervention_lock(reason=reason, tx_id=tx_id)
+        print(f"[MANUAL INTERVENTION LOCK] {reason}")
+    except Exception as db_err:
+        print(f"[CRITICAL] Could not persist manual lock: {db_err}")
+
 
 def extract_quote_fees(quote):
     """Return validated (network_fee, pool_fee_percent), or None for unusable fee data."""
@@ -145,9 +163,20 @@ async def check_and_swap(client, instruments, sell_token, buy_token, net_min, ne
     global swaps_done, swap_halted
     
     
-    if swaps_done >= DAILY_LIMIT:
-        return False
-        
+    if swap_halted:
+        return "HALTED_MANUAL_INTERVENTION"
+    try:
+        remaining, control_state = _allowance_remaining()
+        if control_state.get("manual_intervention_required"):
+            swap_halted = True
+            print("[MANUAL INTERVENTION LOCK] Owner review is required.")
+            return "HALTED_MANUAL_INTERVENTION"
+        if remaining <= 0:
+            return False
+    except Exception as control_err:
+        print(f"[CONTROL STATE ERROR] Failing closed for this attempt: {control_err}")
+        return "HALTED_CONTROL_STATE"
+
     try:
         account = await client.get_account_info()
     except Exception as e:
@@ -231,52 +260,58 @@ async def check_and_swap(client, instruments, sell_token, buy_token, net_min, ne
                     buy_instrument=instruments[buy_token],
                 )
                 
-                if not result or not result.get("verify"):
-                    print(f" PARTIAL SWAP DETECTED. Halting for manual review.")
-                    swap_halted = True
-                    return "HALTED_PARTIAL_SWAP"
+                tx_id = result.get("id") if isinstance(result, dict) else None
+                confirmed = bool(result and isinstance(result, dict) and result.get("verify"))
+                if not confirmed:
+                    _activate_manual_lock(
+                        "Cantex did not confirm the swap response. Execution outcome is uncertain.",
+                        tx_id=tx_id
+                    )
+                    return "HALTED_MANUAL_INTERVENTION"
 
                 end_time = time.perf_counter()
-                exec_time = end_time - start_time
-                tx_id = result.get('id')
-                print(f" SWAP SUCCESS in {exec_time:.2f}s! TX ID: {tx_id}")
-
-                # --- VERIFY THE SWAP ACTUALLY EXECUTED ON CANTEX ---
-                await asyncio.sleep(POST_SWAP_COOLDOWN)
-
-                try:
-                    account_after = await client.get_account_info()
-                    balance_after = Decimal("0")
-                    for item in getattr(account_after, "tokens", []) or []:
-                        sym = getattr(item, "instrument_symbol", None)
-                        if sym and str(sym).upper() == sell_token:
-                            balance_after = Decimal(str(getattr(item, "unlocked_amount", 0)))
-                            break
-
-                    actual_decrease = current_balance - balance_after
-                    if actual_decrease < sell_amount_tokens * Decimal("0.99"):
-                        print(f" [SWAP FAILED ON CANTEX] Expected {sell_amount_tokens} {sell_token} decrease, got {actual_decrease}. Halting.")
-                        swap_halted = True
-                        return "HALTED_PARTIAL_SWAP"
-                except Exception as verify_err:
-                    print(f" [BALANCE CHECK ERROR] Could not verify swap: {verify_err}. Proceeding with count.")
-
-                try:
-                    log_successful_swap(
-                        tx_id=tx_id,
-                        pair=f"{sell_token}->{buy_token}",
-                        sell_token=sell_token,
-                        buy_token=buy_token,
-                        sell_amount=float(sell_amount_tokens),
-                        net_fee=float(network_fee),
-                        pool_fee=float(pool_fee_percent),
-                        usd_value=float(total_usd_value)
+                print(f" SWAP CONFIRMED in {end_time - start_time:.2f}s! TX ID: {tx_id}")
+                if not tx_id:
+                    _activate_manual_lock(
+                        "Cantex confirmed a swap but returned no transaction ID; safe deduplication is impossible."
                     )
-                except Exception as db_err:
-                    print(f" [DB ERROR] Swap succeeded but log failed: {db_err}. Incrementing count anyway.")
+                    return "HALTED_MANUAL_INTERVENTION"
 
-                swaps_done += 1
-                print(f" Logged swap to database. Total today: {swaps_done}/{DAILY_LIMIT}")
+                # Record confirmed execution before checking wallet balances.
+                logged = False
+                db_error = None
+                for attempt in range(3):
+                    try:
+                        logged = log_successful_swap(
+                            tx_id=tx_id,
+                            pair=f"{sell_token}->{buy_token}",
+                            sell_token=sell_token,
+                            buy_token=buy_token,
+                            sell_amount=float(sell_amount_tokens),
+                            net_fee=float(network_fee),
+                            pool_fee=float(pool_fee_percent),
+                            usd_value=float(total_usd_value)
+                        )
+                        db_error = None
+                        break
+                    except Exception as err:
+                        db_error = err
+                        print(f"[DB LOG RETRY {attempt + 1}/3] {err}")
+                        if attempt < 2:
+                            await asyncio.sleep(2 * (attempt + 1))
+
+                if db_error is not None:
+                    _activate_manual_lock(
+                        f"Cantex confirmed transaction {tx_id}, but DB logging failed after retries: {db_error}",
+                        tx_id=tx_id
+                    )
+                    return "HALTED_MANUAL_INTERVENTION"
+
+                if logged:
+                    swaps_done += 1
+                    print(f" Confirmed swap recorded. Session count: {swaps_done}/{DAILY_LIMIT}")
+                else:
+                    print(f" Transaction {tx_id} already exists in DB; duplicate count prevented.")
 
                 if pair_key and direction:
                     _last_swap_direction[pair_key] = direction
@@ -285,6 +320,39 @@ async def check_and_swap(client, instruments, sell_token, buy_token, net_min, ne
 
                 _net_cc_delta[sell_token] = _net_cc_delta.get(sell_token, Decimal("0")) - (sell_amount_tokens * cc_price)
                 _net_cc_delta[buy_token] = _net_cc_delta.get(buy_token, Decimal("0")) + (sell_amount_tokens * cc_price)
+
+                verified_balance = False
+                verify_error = None
+                for attempt in range(3):
+                    try:
+                        await asyncio.sleep(POST_SWAP_COOLDOWN if attempt == 0 else 5)
+                        account_after = await client.get_account_info()
+                        balance_after = Decimal("0")
+                        found = False
+                        for item in getattr(account_after, "tokens", []) or []:
+                            sym = getattr(item, "instrument_symbol", None)
+                            if sym and str(sym).upper() == sell_token:
+                                balance_after = Decimal(str(getattr(item, "unlocked_amount", 0)))
+                                found = True
+                                break
+                        if found:
+                            actual_decrease = current_balance - balance_after
+                            if actual_decrease >= sell_amount_tokens * Decimal("0.99"):
+                                verified_balance = True
+                                break
+                            verify_error = f"Expected decrease {sell_amount_tokens}; observed {actual_decrease}."
+                        else:
+                            verify_error = f"{sell_token} missing from refreshed account balances."
+                    except Exception as err:
+                        verify_error = str(err)
+                    print(f"[BALANCE VERIFY RETRY {attempt + 1}/3] {verify_error}")
+
+                if not verified_balance:
+                    _activate_manual_lock(
+                        f"Confirmed transaction {tx_id} is recorded, but wallet verification remains inconsistent: {verify_error}",
+                        tx_id=tx_id
+                    )
+                    return "HALTED_MANUAL_INTERVENTION"
 
                 return True
             except Exception as e:
@@ -325,20 +393,32 @@ async def fetch_active_hunter_rules():
 
 async def main():
     global swaps_done, swap_halted
-    swap_halted = False 
+    swap_halted = False
     print(" Starting Rebate Hunter (Dynamic 100-102 CC + Strict Ping-Pong)...")
-    
-    swaps_done = get_today_swap_count()
-    print(f" Today's swaps already completed: {swaps_done}/{DAILY_LIMIT}")
-    
-    if swaps_done >= DAILY_LIMIT:
+
+    try:
+        remaining, control_state = _allowance_remaining()
+    except Exception as control_err:
+        print(f"[CRITICAL] Cannot read Hunter control state; fail-closed: {control_err}")
+        return "HALTED_CONTROL_STATE"
+
+    if control_state.get("manual_intervention_required"):
+        swap_halted = True
+        print("[MANUAL INTERVENTION LOCK] Persistent lock active. Owner review is required.")
+        return "HALTED_MANUAL_INTERVENTION"
+
+    swaps_done = DAILY_LIMIT - remaining
+    print(f" Today's effective allowance: {remaining} remaining ({swaps_done}/{DAILY_LIMIT} used).")
+
+    if remaining <= 0:
         now = datetime.now(timezone.utc)
         next_midnight_utc = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
         seconds_until_next_run = int((next_midnight_utc - now).total_seconds())
-        print(f" Daily limit reached ({swaps_done}/{DAILY_LIMIT}). Sleeping {seconds_until_next_run}s until UTC midnight.")
+        print(f" Daily allowance exhausted. Sleeping {seconds_until_next_run}s until UTC midnight.")
         return f"DAILY_LIMIT_SLEEP:{seconds_until_next_run}"
 
     restored_rule_signature = None
+    remaining = DAILY_LIMIT
 
     client = await connect_sdk()
     
@@ -351,7 +431,20 @@ async def main():
             if symbol and instrument is not None:
                 instruments[str(symbol).upper()] = instrument
 
-        while swaps_done < DAILY_LIMIT and not swap_halted:
+        while remaining > 0 and not swap_halted:
+            try:
+                remaining, control_state = _allowance_remaining()
+                if control_state.get("manual_intervention_required"):
+                    swap_halted = True
+                    print("[MANUAL INTERVENTION LOCK] Persistent lock activated. Stopping Hunter.")
+                    break
+                swaps_done = DAILY_LIMIT - remaining
+                if remaining <= 0:
+                    break
+            except Exception as control_err:
+                print(f"[CONTROL STATE ERROR] Cannot safely read allowance; pausing for 60 seconds: {control_err}")
+                await asyncio.sleep(60)
+                continue
 
             # Always refresh active rules from the database
             TOKEN_PAIRS = await fetch_active_hunter_rules()
@@ -517,7 +610,7 @@ async def main():
                      # Stack guard protects against over-accumulation over many swaps.
                     # For the last 3 swaps of the day, bypass it — the marginal
                     # accumulation is negligible and we don't want to miss a rebate.
-                    if swaps_done < 22 and _net_cc_delta.get(buy, Decimal("0")) + req_cc > Decimal("200"):
+                    if remaining > 3 and _net_cc_delta.get(buy, Decimal("0")) + req_cc > Decimal("200"):
                         scan_stats["stack_guard"] += 1
                         print(f" [STACK GUARD] Skipping {sell}->{buy}. Too much {buy} stacked.")
                         continue
@@ -625,6 +718,14 @@ async def main():
             if asyncio.iscoroutine(result):
                 await result
         print("Connection closed.")
+    if swap_halted:
+        return "HALTED_MANUAL_INTERVENTION"
+    if remaining <= 0:
+        now = datetime.now(timezone.utc)
+        next_midnight_utc = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+        seconds_until_next_run = max(1, int((next_midnight_utc - now).total_seconds()))
+        print(f" Daily allowance exhausted. Sleeping {seconds_until_next_run}s until UTC midnight.")
+        return f"DAILY_LIMIT_SLEEP:{seconds_until_next_run}"
     return False
 
 if __name__ == "__main__":

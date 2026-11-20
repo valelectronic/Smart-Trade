@@ -1,57 +1,102 @@
-"""PostgreSQL storage for Cantex monitoring orders and rebate swaps (Neon)."""
+"""PostgreSQL storage for the Cantex Rebate Hunter (Neon).
+
+Tables used by the current Rebate Hunter:
+- rebate_swaps: confirmed executions, uniquely identified by tx_id.
+- hunter_rules: configured token-pair rules.
+- hunter_control: persistent manual-intervention lock and daily allowance.
+
+Legacy orders table/functions are intentionally not created or exposed here.
+This code does not DROP an existing orders table or delete any existing data.
+"""
 
 import os
+
 import psycopg2
-from datetime import datetime, timezone
 from psycopg2.extras import RealDictCursor
 
 DATABASE_URL = os.getenv("DATABASE_URL")
+DAILY_SWAP_LIMIT = 25
 
 if not DATABASE_URL:
-    raise ValueError("DATABASE_URL environment variable is missing. Check your .env file.")
+    raise ValueError(
+        "DATABASE_URL environment variable is missing. Check your .env file."
+    )
 
-ORDER_COLUMNS = (
-    "id",
-    "market",
-    "action",
-    "sell_token",
-    "buy_token",
-    "route_token",
-    "trigger_price_usd",
-    "direction",
-    "amount",
-)
 
 def get_connection():
-    """Create a short-lived PostgreSQL connection via PgBouncer."""
-    connection = psycopg2.connect(
-        DATABASE_URL, 
-        cursor_factory=RealDictCursor, 
+    """Create a short-lived PostgreSQL connection."""
+    return psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
+
+
+def _ensure_control_row(cursor):
+    """Ensure the singleton control row exists and reset allowance on UTC date change.
+
+    The manual-intervention lock is deliberately preserved across daily resets.
+    The initial allowance accounts for swaps already recorded today.
+    """
+    cursor.execute(
+        """
+        INSERT INTO hunter_control (
+            id, manual_lock, lock_reason, lock_tx_id, locked_at,
+            resolution_note, resolved_at, daily_date, swaps_remaining, updated_at
+        )
+        SELECT
+            1, FALSE, NULL, NULL, NULL, NULL, NULL,
+            (NOW() AT TIME ZONE 'UTC')::date,
+            GREATEST(
+                0,
+                %s - (
+                    SELECT COUNT(*)::integer
+                    FROM rebate_swaps
+                    WHERE created_at >=
+                        (date_trunc('day', NOW() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC')
+                      AND created_at <
+                        ((date_trunc('day', NOW() AT TIME ZONE 'UTC') + INTERVAL '1 day')
+                         AT TIME ZONE 'UTC')
+                )
+            ),
+            NOW()
+        ON CONFLICT (id) DO NOTHING
+        """,
+        (DAILY_SWAP_LIMIT,),
     )
-    return connection
+
+    # A new UTC day restores the allowance. Do not clear a manual lock.
+    cursor.execute(
+        """
+        UPDATE hunter_control
+        SET daily_date = (NOW() AT TIME ZONE 'UTC')::date,
+            swaps_remaining = GREATEST(
+                0,
+                %s - (
+                    SELECT COUNT(*)::integer
+                    FROM rebate_swaps
+                    WHERE created_at >=
+                        (date_trunc('day', NOW() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC')
+                      AND created_at <
+                        ((date_trunc('day', NOW() AT TIME ZONE 'UTC') + INTERVAL '1 day')
+                         AT TIME ZONE 'UTC')
+                )
+            ),
+            updated_at = NOW()
+        WHERE id = 1
+          AND daily_date <> (NOW() AT TIME ZONE 'UTC')::date
+        """,
+        (DAILY_SWAP_LIMIT,),
+    )
+
+    cursor.execute("SELECT * FROM hunter_control WHERE id = 1 FOR UPDATE")
+    row = cursor.fetchone()
+    if row is None:
+        raise RuntimeError("Could not initialise Hunter control state")
+    return row
+
 
 def init_db():
-    """Create all tables if they do not already exist."""
+    """Create required tables and initialise the persistent control row."""
     connection = get_connection()
     try:
         with connection.cursor() as cursor:
-            # 1. Orders table (kept for backward compatibility, unused in Lean Mode)
-            cursor.execute(
-                """
-                CREATE TABLE IF NOT EXISTS orders (
-                    id TEXT PRIMARY KEY,
-                    market TEXT NOT NULL,
-                    action TEXT NOT NULL,
-                    sell_token TEXT NOT NULL,
-                    buy_token TEXT NOT NULL,
-                    route_token TEXT,
-                    trigger_price_usd TEXT NOT NULL,
-                    direction TEXT NOT NULL,
-                    amount TEXT NOT NULL
-                )
-                """
-            )
-            # 2. Rebate Swaps table
             cursor.execute(
                 """
                 CREATE TABLE IF NOT EXISTS rebate_swaps (
@@ -64,11 +109,10 @@ def init_db():
                     network_fee TEXT NOT NULL,
                     pool_fee TEXT NOT NULL,
                     usd_value TEXT NOT NULL,
-                    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
                 )
                 """
             )
-            # 3. Hunter Rules table
             cursor.execute(
                 """
                 CREATE TABLE IF NOT EXISTS hunter_rules (
@@ -78,64 +122,259 @@ def init_db():
                     net_min TEXT NOT NULL,
                     net_max TEXT NOT NULL,
                     is_active BOOLEAN DEFAULT TRUE,
-                    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+                    created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
                 )
                 """
             )
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS hunter_control (
+                    id SMALLINT PRIMARY KEY CHECK (id = 1),
+                    manual_lock BOOLEAN NOT NULL DEFAULT FALSE,
+                    lock_reason TEXT,
+                    lock_tx_id TEXT,
+                    locked_at TIMESTAMPTZ,
+                    resolution_note TEXT,
+                    resolved_at TIMESTAMPTZ,
+                    daily_date DATE NOT NULL,
+                    swaps_remaining INTEGER NOT NULL
+                        CHECK (swaps_remaining BETWEEN 0 AND 25),
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+                )
+                """
+            )
+            _ensure_control_row(cursor)
         connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
     finally:
         connection.close()
 
+
+def get_hunter_control_state():
+    """Return manual-lock state and today's remaining allowance."""
+    connection = get_connection()
+    try:
+        with connection.cursor() as cursor:
+            row = _ensure_control_row(cursor)
+        connection.commit()
+        return {
+            "manual_intervention_required": bool(row["manual_lock"]),
+            "lock_reason": row["lock_reason"],
+            "lock_tx_id": row["lock_tx_id"],
+            "locked_at": row["locked_at"].isoformat() if row["locked_at"] else None,
+            "daily_date": row["daily_date"].isoformat(),
+            "swaps_remaining": int(row["swaps_remaining"]),
+            "daily_limit": DAILY_SWAP_LIMIT,
+            "updated_at": row["updated_at"].isoformat() if row["updated_at"] else None,
+        }
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
+
+
+def set_daily_swaps_remaining(swaps_remaining: int):
+    """Set the remaining allowance for today (0 to 25)."""
+    if isinstance(swaps_remaining, bool) or not isinstance(swaps_remaining, int):
+        raise ValueError("swaps_remaining must be an integer")
+    if not 0 <= swaps_remaining <= DAILY_SWAP_LIMIT:
+        raise ValueError(f"swaps_remaining must be between 0 and {DAILY_SWAP_LIMIT}")
+
+    connection = get_connection()
+    try:
+        with connection.cursor() as cursor:
+            _ensure_control_row(cursor)
+            cursor.execute(
+                """
+                UPDATE hunter_control
+                SET swaps_remaining = %s, updated_at = NOW()
+                WHERE id = 1
+                RETURNING daily_date, swaps_remaining, manual_lock
+                """,
+                (swaps_remaining,),
+            )
+            row = cursor.fetchone()
+        connection.commit()
+        return {
+            "daily_date": row["daily_date"].isoformat(),
+            "swaps_remaining": int(row["swaps_remaining"]),
+            "daily_limit": DAILY_SWAP_LIMIT,
+            "manual_intervention_required": bool(row["manual_lock"]),
+        }
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
+
+
+def activate_manual_intervention_lock(reason: str, tx_id: str | None = None):
+    """Persist a critical lock. Ordinary market/quote rejections do not belong here."""
+    reason = str(reason or "").strip()
+    if len(reason) < 5:
+        raise ValueError("A meaningful manual-intervention reason is required")
+
+    connection = get_connection()
+    try:
+        with connection.cursor() as cursor:
+            _ensure_control_row(cursor)
+            cursor.execute(
+                """
+                UPDATE hunter_control
+                SET manual_lock = TRUE,
+                    lock_reason = COALESCE(lock_reason, %s),
+                    lock_tx_id = COALESCE(lock_tx_id, %s),
+                    locked_at = COALESCE(locked_at, NOW()),
+                    updated_at = NOW()
+                WHERE id = 1
+                RETURNING manual_lock, lock_reason, lock_tx_id, locked_at
+                """,
+                (reason[:2000], str(tx_id)[:300] if tx_id else None),
+            )
+            row = cursor.fetchone()
+        connection.commit()
+        return {
+            "manual_intervention_required": bool(row["manual_lock"]),
+            "lock_reason": row["lock_reason"],
+            "lock_tx_id": row["lock_tx_id"],
+            "locked_at": row["locked_at"].isoformat() if row["locked_at"] else None,
+        }
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
+
+
+def clear_manual_intervention_lock(resolution_note: str):
+    """Clear a lock only after an explicit owner resolution note."""
+    note = str(resolution_note or "").strip()
+    if len(note) < 5:
+        raise ValueError("Resolution note must contain at least 5 characters")
+
+    connection = get_connection()
+    try:
+        with connection.cursor() as cursor:
+            _ensure_control_row(cursor)
+            cursor.execute(
+                """
+                UPDATE hunter_control
+                SET manual_lock = FALSE,
+                    lock_reason = NULL,
+                    lock_tx_id = NULL,
+                    locked_at = NULL,
+                    resolution_note = %s,
+                    resolved_at = NOW(),
+                    updated_at = NOW()
+                WHERE id = 1 AND manual_lock = TRUE
+                RETURNING id
+                """,
+                (note[:1000],),
+            )
+            cleared = cursor.fetchone() is not None
+        connection.commit()
+        return {"cleared": cleared}
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
+
+
 def get_today_swap_count():
-    """Returns the number of successful swaps executed today."""
+    """Count recorded swaps between today's UTC midnight and tomorrow's."""
     connection = get_connection()
     try:
         with connection.cursor() as cursor:
             cursor.execute(
                 """
-                SELECT COUNT(*) as count 
-                FROM rebate_swaps 
-                WHERE created_at >= CURRENT_DATE
+                SELECT COUNT(*) AS count
+                FROM rebate_swaps
+                WHERE created_at >=
+                    (date_trunc('day', NOW() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC')
+                  AND created_at <
+                    ((date_trunc('day', NOW() AT TIME ZONE 'UTC') + INTERVAL '1 day')
+                     AT TIME ZONE 'UTC')
                 """
             )
             row = cursor.fetchone()
-            return row["count"] if row else 0
+            return int(row["count"]) if row else 0
     finally:
         connection.close()
 
-def log_successful_swap(tx_id, pair, sell_token, buy_token, sell_amount, net_fee, pool_fee, usd_value):
-    """Logs a successful swap to the database."""
+
+def log_successful_swap(
+    tx_id, pair, sell_token, buy_token,
+    sell_amount, net_fee, pool_fee, usd_value
+):
+    """Record a Cantex-confirmed execution exactly once.
+
+    Returns True if inserted, False if tx_id was already present.
+    A newly inserted execution decrements today's remaining allowance in the
+    SAME database transaction. A duplicate never decrements it again.
+    """
+    tx_id = str(tx_id or "").strip()
+    if not tx_id:
+        raise ValueError("tx_id cannot be empty")
+
     connection = get_connection()
     try:
         with connection.cursor() as cursor:
             cursor.execute(
                 """
                 INSERT INTO rebate_swaps (
-                    tx_id, pair, sell_token, buy_token, 
+                    tx_id, pair, sell_token, buy_token,
                     sell_amount, network_fee, pool_fee, usd_value
                 )
                 VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
                 ON CONFLICT (tx_id) DO NOTHING
+                RETURNING id
                 """,
                 (
-                    str(tx_id), str(pair), str(sell_token), str(buy_token),
-                    str(sell_amount), str(net_fee), str(pool_fee), str(usd_value)
+                    tx_id, str(pair), str(sell_token), str(buy_token),
+                    str(sell_amount), str(net_fee), str(pool_fee), str(usd_value),
                 ),
             )
+            inserted = cursor.fetchone() is not None
+
+            if inserted:
+                # Initialise/reset and lock the control row before decrementing.
+                _ensure_control_row(cursor)
+                cursor.execute(
+                    """
+                    UPDATE hunter_control
+                    SET swaps_remaining = GREATEST(0, swaps_remaining - 1),
+                        updated_at = NOW()
+                    WHERE id = 1
+                    """
+                )
+
         connection.commit()
+        return inserted
+    except Exception:
+        connection.rollback()
+        raise
     finally:
         connection.close()
 
+
 def get_today_fees_spent():
-    """Returns the total network fees spent today in CC."""
+    """Return network fees spent today in CC, using UTC day boundaries."""
     connection = get_connection()
     try:
         with connection.cursor() as cursor:
             cursor.execute(
                 """
-                SELECT COALESCE(SUM(CAST(network_fee AS DECIMAL)), 0) as total_fees
-                FROM rebate_swaps 
-                WHERE created_at >= CURRENT_DATE
+                SELECT COALESCE(SUM(CAST(network_fee AS DECIMAL)), 0) AS total_fees
+                FROM rebate_swaps
+                WHERE created_at >=
+                    (date_trunc('day', NOW() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC')
+                  AND created_at <
+                    ((date_trunc('day', NOW() AT TIME ZONE 'UTC') + INTERVAL '1 day')
+                     AT TIME ZONE 'UTC')
                 """
             )
             row = cursor.fetchone()
@@ -143,97 +382,33 @@ def get_today_fees_spent():
     finally:
         connection.close()
 
+
 def delete_hunter_rule(rule_id: int):
-    """Delete a hunter rule by ID."""
+    """Delete a Hunter rule by ID."""
     connection = get_connection()
     try:
         with connection.cursor() as cursor:
             cursor.execute("DELETE FROM hunter_rules WHERE id = %s", (rule_id,))
-            rowcount = cursor.rowcount
+            deleted = cursor.rowcount > 0
         connection.commit()
-        return rowcount > 0
+        return deleted
     finally:
         connection.close()
+
 
 def get_active_hunter_rules():
-    """Returns a list of active hunter rules (tokens only)."""
-    connection = get_connection()
-    try:
-        with connection.cursor() as cursor:
-            cursor.execute(
-                "SELECT token_a, token_b FROM hunter_rules WHERE is_active = TRUE"
-            )
-            return cursor.fetchall()
-    finally:
-        connection.close()
-
-# Legacy order functions (kept for backward compatibility, unused in Lean Mode)
-def add_order(order):
-    """Insert an order into PostgreSQL."""
-    missing = [
-        column
-        for column in ORDER_COLUMNS
-        if column not in order or (order[column] is None and column != "route_token")
-    ]
-    if missing:
-        raise ValueError(f"Missing required order fields: {missing}")
-
-    values = {
-        column: (str(order[column]).strip() if order[column] is not None else "")
-        for column in ORDER_COLUMNS
-    }
-
-    if not values["id"]:
-        raise ValueError("Order id cannot be empty")
-
+    """Return active Hunter rules (token pairs only)."""
     connection = get_connection()
     try:
         with connection.cursor() as cursor:
             cursor.execute(
                 """
-                INSERT INTO orders (
-                    id, market, action, sell_token, buy_token, 
-                    route_token, trigger_price_usd, direction, amount
-                )
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
-                """,
-                tuple(values[column] for column in ORDER_COLUMNS),
-            )
-        connection.commit()
-        return values
-    finally:
-        connection.close()
-
-def get_all_orders():
-    """Return every order, ordered by id."""
-    connection = get_connection()
-    try:
-        with connection.cursor() as cursor:
-            cursor.execute(
-                """
-                SELECT
-                    id, market, action, sell_token, buy_token, 
-                    route_token, trigger_price_usd, direction, amount
-                FROM orders
+                SELECT token_a, token_b
+                FROM hunter_rules
+                WHERE is_active = TRUE
                 ORDER BY id
                 """
             )
-            rows = cursor.fetchall()
-        return [dict(row) for row in rows]
-    finally:
-        connection.close()
-
-def delete_order(order_id):
-    """Delete an order by id. Return True if an order was deleted."""
-    connection = get_connection()
-    try:
-        with connection.cursor() as cursor:
-            cursor.execute(
-                "DELETE FROM orders WHERE id = %s",
-                (str(order_id),),
-            )
-            rowcount = cursor.rowcount
-        connection.commit()
-        return rowcount > 0
+            return cursor.fetchall()
     finally:
         connection.close()

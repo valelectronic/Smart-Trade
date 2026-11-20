@@ -16,7 +16,10 @@ PORT = int(os.getenv("PORT", 8000))
 
 MONITOR_RETRY_SECONDS = 5
 HUNTER_RETRY_SECONDS = 10
-HUNTER_DAILY_LIMIT_SLEEP = 3600  # fallback only; real duration comes from the hunter
+HUNTER_CONTROL_RETRY_SECONDS = 60
+HUNTER_MANUAL_REVIEW_RETRY_SECONDS = 300
+HUNTER_DAILY_LIMIT_FALLBACK_SECONDS = 3600
+API_STARTUP_TIMEOUT_SECONDS = 30
 
 
 async def monitor_supervisor():
@@ -33,64 +36,83 @@ async def monitor_supervisor():
         await asyncio.sleep(MONITOR_RETRY_SECONDS)
 
 
+async def _sleep_until_retry(label: str, seconds: int):
+    print(f"[HUNTER] {label}. Retrying in {seconds} seconds.")
+    await asyncio.sleep(seconds)
+
+
 async def hunter_supervisor():
+    """Supervise the Hunter without rapid retries during control/DB failures."""
     while True:
         try:
             print("[HUNTER] Starting Rebate Hunter.")
             result = await run_rebate_hunter()
 
-            # CHANGE 1: dynamic daily-limit sleep.
-            # The hunter computes "seconds until UTC midnight" and returns it here.
-            # Without this branch, the hunter would fall to the else and retry every 10s,
-            # hammering the DB all night for zero work.
             if isinstance(result, str) and result.startswith("DAILY_LIMIT_SLEEP:"):
                 try:
                     seconds = int(result.split(":", 1)[1])
-                except ValueError:
-                    print("[HUNTER WARNING] Malformed DAILY_LIMIT_SLEEP, falling back to 3600s.")
-                    seconds = HUNTER_DAILY_LIMIT_SLEEP
-                print(f"[HUNTER] Daily limit reached. Sleeping {seconds}s until UTC midnight.")
+                    if seconds <= 0:
+                        seconds = 1
+                except (TypeError, ValueError):
+                    print("[HUNTER WARNING] Malformed daily-limit sleep; using fallback.")
+                    seconds = HUNTER_DAILY_LIMIT_FALLBACK_SECONDS
+
+                print(f"[HUNTER] Daily allowance exhausted. Sleeping {seconds}s until UTC reset.")
                 await asyncio.sleep(seconds)
 
-            # CHANGE 2: partial-swap halt.
-            # The hunter saw an unverifiable swap and refuses to keep trading.
-            # Without this branch, "return False" would retry every 10s and re-halt,
-            # producing a stop/restart thrash loop all day.
-            elif result == "HALTED_PARTIAL_SWAP":
-                print("[HUNTER] Partial swap detected. Sleeping 1 hour for manual review.")
-                await asyncio.sleep(3600)
+            elif result in ("HALTED_MANUAL_INTERVENTION", "HALTED_PARTIAL_SWAP"):
+                await _sleep_until_retry(
+                    "Persistent manual-intervention lock is active; review it in the dashboard",
+                    HUNTER_MANUAL_REVIEW_RETRY_SECONDS,
+                )
 
-            # CHANGE 3: legacy True fallback (kept for deploy-order safety).
-            # If rebate_hunter.py hasn't been updated yet, it still returns True.
-            # We log loudly so the mismatch is visible instead of silently retrying hourly.
-            elif result is True:
-                print("[HUNTER WARNING] Hunter returned True, not DAILY_LIMIT_SLEEP. "
-                      "Is rebate_hunter.py updated? Falling back to 3600s sleep.")
-                await asyncio.sleep(HUNTER_DAILY_LIMIT_SLEEP)
+            elif result in ("HALTED_CONTROL_STATE", "CONTROL_STATE_UNAVAILABLE"):
+                await _sleep_until_retry(
+                    "Hunter control state is unavailable; trading remains stopped",
+                    HUNTER_CONTROL_RETRY_SECONDS,
+                )
 
             elif result == "NO_RULES":
-                print("[HUNTER] No rules found. Checking again in 60 seconds.")
-                await asyncio.sleep(60)
+                await _sleep_until_retry("No active rules found", 60)
+
+            elif result is True:
+                # Retained for compatibility with the previous Hunter return contract.
+                print("[HUNTER WARNING] Hunter returned True. Using the legacy safety delay.")
+                await asyncio.sleep(HUNTER_DAILY_LIMIT_FALLBACK_SECONDS)
 
             else:
-                print("[HUNTER] Hunter stopped unexpectedly. Retrying in 10 seconds.")
-                await asyncio.sleep(HUNTER_RETRY_SECONDS)
+                await _sleep_until_retry(
+                    f"Hunter exited with status {result!r}",
+                    HUNTER_RETRY_SECONDS,
+                )
 
         except asyncio.CancelledError:
             raise
         except Exception as exc:
             print(f"[HUNTER ERROR] {type(exc).__name__}: {exc}")
-            await asyncio.sleep(HUNTER_RETRY_SECONDS)
+            await asyncio.sleep(HUNTER_CONTROL_RETRY_SECONDS)
+
+
+async def _wait_for_api_start(server: uvicorn.Server) -> bool:
+    """Wait for Uvicorn readiness instead of relying on a fixed two-second delay."""
+    deadline = time.monotonic() + API_STARTUP_TIMEOUT_SECONDS
+
+    while time.monotonic() < deadline:
+        if server.started:
+            return True
+        if server.should_exit:
+            return False
+        await asyncio.sleep(0.1)
+
+    return server.started
 
 
 async def main():
+    # Database initialisation must succeed before background services start.
     init_db()
 
-    # CHANGE 4: boot fingerprint.
-    # One [BOOT] line per process. If you see two different PIDs in the log within
-    # a minute, Railway is running two containers — that's the double-forward cause.
-    # If you see one PID, the double-forward is a code bug inside rebate_hunter.py.
-    print(f"[BOOT] PID={os.getpid()} at {time.strftime('%H:%M:%S')}")
+    print(f"[BOOT] PID={os.getpid()} at {time.strftime('%Y-%m-%d %H:%M:%S')}")
+    print("[SAFETY] Starting API first; monitor and Hunter wait for API readiness.")
 
     server_config = uvicorn.Config(
         app=app,
@@ -100,34 +122,52 @@ async def main():
         reload=False,
         workers=1,
     )
-
     server = uvicorn.Server(server_config)
 
-    print(f"[API] Starting at http://{HOST}:{PORT}")
-    print(f"[API] Documentation: http://{HOST}:{PORT}/docs")
-    print("[SAFETY] Lean Mode: API and Monitor running. Hunter executing swaps.")
+    server_task = asyncio.create_task(server.serve(), name="fastapi-server")
 
-    # Start the API server FIRST so Railway's health check passes
-    server_task = asyncio.create_task(server.serve())
-    await asyncio.sleep(2)
-
-    # Start the monitor (live prices only)
-    monitor_task = asyncio.create_task(monitor_supervisor(), name="cantex-monitor")
-
-    # Start the rebate hunter (strict ping-pong)
-    hunter_task = asyncio.create_task(hunter_supervisor(), name="rebate-hunter")
+    monitor_task = None
+    hunter_task = None
 
     try:
+        if not await _wait_for_api_start(server):
+            raise RuntimeError(
+                f"API did not become ready within {API_STARTUP_TIMEOUT_SECONDS} seconds."
+            )
+
+        print(f"[API] Ready at http://{HOST}:{PORT}")
+        print("[ENGINE] Starting Cantex monitoring engine.")
+        monitor_task = asyncio.create_task(
+            monitor_supervisor(), name="cantex-monitor"
+        )
+
+        print("[HUNTER] Starting Rebate Hunter supervisor.")
+        hunter_task = asyncio.create_task(
+            hunter_supervisor(), name="rebate-hunter"
+        )
+
         await server_task
+
     finally:
-        monitor_task.cancel()
-        hunter_task.cancel()
         for task in (monitor_task, hunter_task):
+            if task is not None:
+                task.cancel()
+
+        for task in (monitor_task, hunter_task):
+            if task is not None:
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+
+        if not server_task.done():
+            server.should_exit = True
             try:
-                await task
+                await server_task
             except asyncio.CancelledError:
                 pass
-        print("[SERVER] API, monitor, and hunter shutdown complete.")
+
+        print("[SERVER] API, monitor, and Hunter shutdown complete.")
 
 
 if __name__ == "__main__":

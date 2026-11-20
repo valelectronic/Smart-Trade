@@ -1,4 +1,10 @@
-"""FastAPI endpoints for the Cantex Rebate Hunter (Lean Mode)."""
+"""FastAPI endpoints for the Cantex Rebate Hunter.
+
+Control-state database functions are implemented in the next database stage:
+- get_hunter_control_state()
+- set_daily_swaps_remaining(swaps_remaining)
+- clear_manual_intervention_lock(resolution_note)
+"""
 
 import asyncio
 import json
@@ -11,23 +17,22 @@ from decimal import Decimal
 
 from fastapi import FastAPI, HTTPException, Response, status
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from cantex_api import connect_sdk
-from config import PUBLIC_BASE  # <-- ADDED
+from config import PUBLIC_BASE
 from postgres_database import (
     init_db,
     get_connection,
-    get_today_fees_spent,
     delete_hunter_rule,
+    get_hunter_control_state,
+    set_daily_swaps_remaining,
+    clear_manual_intervention_lock,
 )
 
 # --- All Tokens Cache ---
 _all_tokens_cache = {"tokens": [], "timestamp": 0}
-# --- Fees cache (protects Neon from 10s frontend polling) ---
-_fees_cache = {"data": {}, "timestamp": 0}
-# --- Kill switch file ---
-PAUSE_FILE = Path(__file__).parent / "bot_control.json"
+# Rule-change notification remains a lightweight local signal.
 RULE_CHANGE_FILE = Path(__file__).resolve().parent / "hunter_rules_changed.flag"
 
 
@@ -63,7 +68,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Cantex Rebate Hunter API",
-    version="2.0.0",
+    version="2.1.0",
     description="Lean API for the Rebate Hunter. No Buy/Sell orders.",
     lifespan=lifespan,
 )
@@ -87,95 +92,59 @@ class HunterRuleCreate(BaseModel):
     net_min: str
     net_max: str
 
-class PauseRequest(BaseModel):
-        paused: bool
+class DailyAllowanceRequest(BaseModel):
+    swaps_remaining: int = Field(ge=0, le=25)
+
+class ManualInterventionClearRequest(BaseModel):
+    acknowledged: bool
+    resolution_note: str = Field(min_length=5, max_length=1000)
 
 
 @app.get("/api/health")
 def health():
     return {"status": "ok"}
 
-@app.get("/api/portfolio-value")
-async def get_portfolio_value():
+@app.get("/api/hunter-control")
+def get_hunter_control():
+    """Return persistent intervention-lock and daily-allowance state."""
     try:
-        client = await connect_sdk()
-        try:
-            account = await client.get_account_info()
-            balances = {}
-            for item in getattr(account, "tokens", []) or []:
-                symbol = getattr(item, "instrument_symbol", None)
-                unlocked = getattr(item, "unlocked_amount", None)
-                if symbol and unlocked is not None:
-                    balances[symbol.upper()] = Decimal(str(unlocked))
-        finally:
-            close = getattr(client, "close", None)
-            if close:
-                result = close()
-                if asyncio.iscoroutine(result):
-                    await result
-
-        prices_file = Path(__file__).parent / "prices.json"
-        prices = {}
-        if prices_file.exists():
-            try:
-                with prices_file.open("r") as f:
-                    prices = json.load(f)
-            except Exception:
-                pass
-        
-        cc_rate = Decimal(prices.get("CC-USDC", "0"))
-        if cc_rate <= 0:
-            return {"error": "CC rate not available", "status": "failed"}
-
-        total_usd = Decimal("0")
-        breakdown = {}
-
-        for token, amount in balances.items():
-            if amount <= 0:
-                continue
-            token_upper = token.upper()
-            usd_price = Decimal("0")
-
-            if f"{token_upper}-USDC" in prices:
-                usd_price = Decimal(prices[f"{token_upper}-USDC"])
-            elif f"{token_upper}-CC" in prices:
-                token_cc_price = Decimal(prices[f"{token_upper}-CC"])
-                usd_price = token_cc_price * cc_rate
-            elif token_upper == "CC":
-                usd_price = cc_rate
-
-            if usd_price > 0:
-                value = amount * usd_price
-                total_usd += value
-                breakdown[token] = str(value)
-
-        return {"total_usd": str(total_usd), "breakdown": breakdown, "status": "success"}
+        state = get_hunter_control_state()
+        # Keep both names during the UI/backend transition.
+        state["manual_lock"] = bool(state.get("manual_intervention_required", False))
+        return state
     except Exception as e:
-        return {"error": str(e), "status": "failed"}
+        raise HTTPException(status_code=500, detail=f"Could not read Hunter control state: {e}")
 
 
-@app.post("/api/hunter-pause")
-def set_pause_state(req: PauseRequest):
+@app.put("/api/hunter-allowance")
+def update_daily_allowance(req: DailyAllowanceRequest):
+    """Set how many additional swaps the Hunter may execute today (0–25)."""
     try:
-        tmp = PAUSE_FILE.with_suffix(".tmp")
-        with tmp.open("w") as f:
-            json.dump({"paused": req.paused}, f)
-        os.replace(tmp, PAUSE_FILE)  # atomic — bot never reads a half-written file
-        return {"status": "success", "paused": req.paused}
+        state = set_daily_swaps_remaining(req.swaps_remaining)
+        return {"status": "success", "message": "Daily allowance updated", **state}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=f"Could not update daily allowance: {e}")
 
-@app.get("/api/hunter-pause")
-def get_pause_state():
-    if PAUSE_FILE.exists():
-        try:
-            with PAUSE_FILE.open("r") as f:
-                return json.load(f)
-        except Exception:
-            pass
-    return {"paused": False}
 
-    
+@app.post("/api/manual-intervention/clear")
+def clear_manual_intervention(req: ManualInterventionClearRequest):
+    """Clear a persistent critical-execution lock only after owner acknowledgement."""
+    if req.acknowledged is not True:
+        raise HTTPException(status_code=400, detail="Explicit owner acknowledgement is required")
+    try:
+        result = clear_manual_intervention_lock(req.resolution_note.strip())
+        if not result.get("cleared", False):
+            raise HTTPException(status_code=409, detail="No active manual-intervention lock was cleared")
+        return {"status": "success", **result}
+    except HTTPException:
+        raise
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Could not clear manual-intervention lock: {e}")
+
 
 @app.get("/api/balances")
 async def get_balances():
@@ -266,24 +235,6 @@ def remove_hunter_rule(rule_id: int):
 
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
-@app.get("/api/hunter-fees")
-def get_fees_spent():
-    global _fees_cache
-    now = time.time()
-
-    # Serve from cache for 30s — the frontend polls every 10s,
-    # so without this we'd hit Neon 6x more than necessary.
-    if now - _fees_cache["timestamp"] < 30 and _fees_cache["data"]:
-        return _fees_cache["data"]
-
-    try:
-        total = get_today_fees_spent()
-        data = {"total_fees_cc": total, "status": "success"}
-        _fees_cache = {"data": data, "timestamp": now}
-        return data
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
 @app.get("/api/hunter-history")
 def get_hunter_history():
     connection = get_connection()
@@ -304,20 +255,28 @@ def get_hunter_history():
 
 @app.get("/api/market-prices")
 def get_market_prices():
-    """Lightweight endpoint that reads prices.json. No DB, no SDK."""
-    prices_file = Path(__file__).parent / "prices.json"
+    """Return the latest BTC and CC USD prices saved by the market monitor."""
+    prices_file = Path(__file__).resolve().parent / "prices.json"
     prices = {}
+
     if prices_file.exists():
         try:
-            with prices_file.open("r") as f:
+            with prices_file.open("r", encoding="utf-8") as f:
                 prices = json.load(f)
-        except Exception:
-            pass
-    
+        except (OSError, json.JSONDecodeError) as exc:
+            print(f"[API WARNING] Could not read market prices: {exc}")
+
+    def safe_price(key):
+        try:
+            value = float(prices.get(key, 0) or 0)
+            return value if value > 0 else 0
+        except (TypeError, ValueError):
+            return 0
+
     return {
-        "cc_usd": float(prices.get("CC-USDC", 0)),
-        "btc_usd": float(prices.get("BTC-USDC", 0)),
-        "status": "success"
+        "cc_usd": safe_price("CC-USDC"),
+        "btc_usd": safe_price("BTC-USDC"),
+        "status": "success",
     }
 
 
@@ -330,7 +289,8 @@ def get_daily_stats():
                 """
                 SELECT sell_amount, network_fee, pool_fee, usd_value
                 FROM rebate_swaps
-                WHERE created_at >= CURRENT_DATE
+                WHERE created_at >= (date_trunc('day', NOW() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC')
+                  AND created_at < ((date_trunc('day', NOW() AT TIME ZONE 'UTC') + INTERVAL '1 day') AT TIME ZONE 'UTC')
                 """
             )
             swaps = cur.fetchall()

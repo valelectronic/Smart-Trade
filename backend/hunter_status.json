@@ -1,11 +1,11 @@
 {
-  "time": "17:34:39",
-  "pair": "Scanning...",
+  "time": "23:10:16",
+  "pair": "NO_RULES",
   "net_fee": 0,
   "pool_fee": 0,
   "usd_value": 0,
   "cc_size": 0,
   "sdk_est_time": 0,
-  "status": " WAITING",
+  "status": "NO_RULES",
   "swaps_done": 0
 }
