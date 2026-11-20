@@ -28,7 +28,32 @@ _all_tokens_cache = {"tokens": [], "timestamp": 0}
 _fees_cache = {"data": {}, "timestamp": 0}
 # --- Kill switch file ---
 PAUSE_FILE = Path(__file__).parent / "bot_control.json"
+RULE_CHANGE_FILE = Path(__file__).resolve().parent / "hunter_rules_changed.flag"
 
+
+def signal_hunter_rules_changed():
+    """
+    Notify the monitor that Hunter Rules have changed.
+
+    Uses an atomic file replacement so the monitor never
+    reads a partially written notification.
+    """
+    try:
+        tmp = RULE_CHANGE_FILE.with_suffix(".tmp")
+
+        with tmp.open("w") as f:
+            f.write(str(time.time_ns()))
+
+        os.replace(tmp, RULE_CHANGE_FILE)
+
+        print("[API] Hunter Rules change signal written.")
+
+    except Exception as e:
+        # The database change has already been committed.
+        # Do not report a failed rule save because the local
+        # notification failed. The monitor's 15-minute
+        # fallback refresh remains available.
+        print(f"[API WARNING] Could not signal Hunter Rules change: {e}")
 
 
 @asynccontextmanager
@@ -150,6 +175,8 @@ def get_pause_state():
             pass
     return {"paused": False}
 
+    
+
 @app.get("/api/balances")
 async def get_balances():
     try:
@@ -210,7 +237,10 @@ def save_hunter_rule(rule: HunterRuleCreate):
                 """,
                 (rule.token_a.upper(), rule.token_b.upper(), rule.net_min, rule.net_max)
             )
-        connection.commit()
+            connection.commit()
+
+        signal_hunter_rules_changed()
+
         return {"status": "success", "message": "Rule saved"}
     finally:
         connection.close()
@@ -219,10 +249,21 @@ def save_hunter_rule(rule: HunterRuleCreate):
 def remove_hunter_rule(rule_id: int):
     try:
         deleted = delete_hunter_rule(rule_id)
+
         if not deleted:
-            raise HTTPException(status_code=404, detail="Rule not found")
+            raise HTTPException(
+                status_code=404,
+                detail="Rule not found"
+            )
+
+        signal_hunter_rules_changed()
+
+    except HTTPException:
+        raise
+
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 @app.get("/api/hunter-fees")

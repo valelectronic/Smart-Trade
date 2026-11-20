@@ -1,11 +1,11 @@
 {
-  "time": "21:54:42",
-  "pair": "TRKXDEFI->MOD",
-  "net_fee": 0.5026,
-  "pool_fee": 0.15,
-  "usd_value": 8.178320670940272,
-  "cc_size": 101.9995094904,
-  "sdk_est_time": 10.2,
-  "status": " MET",
-  "swaps_done": 24
+  "time": "17:34:39",
+  "pair": "Scanning...",
+  "net_fee": 0,
+  "pool_fee": 0,
+  "usd_value": 0,
+  "cc_size": 0,
+  "sdk_est_time": 0,
+  "status": " WAITING",
+  "swaps_done": 0
 }

@@ -14,6 +14,57 @@ def canonical_pair_key(token_a: str, token_b: str) -> str:
     a, b = sorted([token_a, token_b])
     return f"{a}::{b}"
 
+
+def restore_ping_pong_memory(token_pairs):
+    """Restore the latest swap direction for each active pair using Hunter Rule order."""
+    rule_orders = {}
+    for pair in token_pairs:
+        token_a = str(pair["a"]).upper()
+        token_b = str(pair["b"]).upper()
+        rule_orders[canonical_pair_key(token_a, token_b)] = (token_a, token_b)
+
+    if not rule_orders:
+        return
+
+    restored = {}
+    conn = get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT sell_token, buy_token "
+                "FROM rebate_swaps ORDER BY created_at DESC"
+            )
+            for row in cur:
+                sell_token = str(row["sell_token"]).upper()
+                buy_token = str(row["buy_token"]).upper()
+                pair_key = canonical_pair_key(sell_token, buy_token)
+
+                if pair_key not in rule_orders or pair_key in restored:
+                    continue
+
+                token_a, token_b = rule_orders[pair_key]
+                if sell_token == token_a and buy_token == token_b:
+                    restored[pair_key] = "A_TO_B"
+                elif sell_token == token_b and buy_token == token_a:
+                    restored[pair_key] = "B_TO_A"
+
+                if len(restored) == len(rule_orders):
+                    break
+    finally:
+        conn.close()
+
+    # Clear only currently active pairs first. This also removes stale memory
+    # if a rule was removed and later re-added with no recorded swap history.
+    for pair_key in rule_orders:
+        _last_swap_direction.pop(pair_key, None)
+    _last_swap_direction.update(restored)
+    for pair_key, direction in restored.items():
+        print(f" Restored ping-pong memory: {pair_key} = {direction}")
+
+    missing = set(rule_orders) - set(restored)
+    if missing:
+        print(f" No previous swap history found for {len(missing)} active pair(s).")
+
 # --- CONFIGURATION ---
 TARGET_SWAP_SIZE_CC = Decimal("101.5")
 MIN_SWAP_SIZE_CC = Decimal("100.0")
@@ -36,6 +87,31 @@ execution_lock = asyncio.Lock()
 _last_swap_direction = {} 
 _disabled_pairs = {} 
 _net_cc_delta = {} 
+
+def extract_quote_fees(quote):
+    """Return validated (network_fee, pool_fee_percent), or None for unusable fee data."""
+    fees_obj = getattr(quote, "fees", None)
+    if fees_obj is None:
+        return None
+
+    network_fee_obj = getattr(fees_obj, "network_fee", None)
+    network_fee_raw = getattr(network_fee_obj, "amount", None) if network_fee_obj is not None else None
+    pool_fee_raw = getattr(fees_obj, "fee_percentage", None)
+    if network_fee_raw is None or pool_fee_raw is None:
+        return None
+
+    try:
+        network_fee = Decimal(str(network_fee_raw))
+        pool_fee_percent = Decimal(str(pool_fee_raw)) * 100
+    except Exception:
+        return None
+
+    if (not network_fee.is_finite() or not pool_fee_percent.is_finite()
+            or network_fee < 0 or pool_fee_percent < 0):
+        return None
+
+    return network_fee, pool_fee_percent
+
 
 def save_status(status_dict):
     try:
@@ -116,16 +192,12 @@ async def check_and_swap(client, instruments, sell_token, buy_token, net_min, ne
             print(f" Quote failed for {sell_token}->{buy_token}: {e}")
             return False
 
-    network_fee = Decimal("0")
-    pool_fee_percent = Decimal("0")
+    fee_values = extract_quote_fees(quote)
+    if fee_values is None:
+        print(f" Quote for {sell_token}->{buy_token} returned missing or invalid fee data. Skipping execution.")
+        return False
+    network_fee, pool_fee_percent = fee_values
     sdk_est_time = 0.0
-    
-    fees_obj = getattr(quote, "fees", None)
-    if fees_obj:
-        net_fee_obj = getattr(fees_obj, "network_fee", None)
-        if net_fee_obj:
-            network_fee = Decimal(str(getattr(net_fee_obj, "amount", 0)))
-        pool_fee_percent = Decimal(str(getattr(fees_obj, "fee_percentage", 0))) * 100
         
     exec_sec = getattr(quote, "estimated_time_seconds", None)
     if exec_sec is not None:
@@ -266,22 +338,7 @@ async def main():
         print(f" Daily limit reached ({swaps_done}/{DAILY_LIMIT}). Sleeping {seconds_until_next_run}s until UTC midnight.")
         return f"DAILY_LIMIT_SLEEP:{seconds_until_next_run}"
 
-    # --- RESTORE PING-PONG MEMORY FROM DB ---
-    try:
-        conn = get_connection()
-        try:
-            with conn.cursor() as cur:
-                cur.execute("SELECT sell_token, buy_token FROM rebate_swaps ORDER BY created_at DESC LIMIT 1")
-                last_swap = cur.fetchone()
-                if last_swap:
-                    pair_key = canonical_pair_key(last_swap["sell_token"], last_swap["buy_token"])
-                    _last_swap_direction[pair_key] = "A_TO_B" if last_swap["sell_token"] < last_swap["buy_token"] else "B_TO_A"
-                    print(f" Restored memory: Last swap was {last_swap['sell_token']} -> {last_swap['buy_token']}")
-        finally:
-            conn.close()
-    except Exception as e:
-        print(f" Could not restore ping-pong memory: {e}")
-
+    restored_rule_signature = None
 
     client = await connect_sdk()
     
@@ -305,6 +362,21 @@ async def main():
                 await asyncio.sleep(15)
                 continue
 
+            # Restore memory when the active rule set or its A/B order changes.
+            rule_signature = tuple(sorted(
+                (canonical_pair_key(pair["a"], pair["b"]),
+                 str(pair["a"]).upper(), str(pair["b"]).upper())
+                for pair in TOKEN_PAIRS
+            ))
+            if rule_signature != restored_rule_signature:
+                try:
+                    restore_ping_pong_memory(TOKEN_PAIRS)
+                    restored_rule_signature = rule_signature
+                except Exception as e:
+                    print(f" Could not restore ping-pong memory: {e}")
+                    await asyncio.sleep(15)
+                    continue
+
             # No active rules: wait
             if not TOKEN_PAIRS:
                 print(" NO ACTIVE RULES. Waiting 60 seconds...")
@@ -326,6 +398,14 @@ async def main():
 
             best_opportunity = None
             lowest_fee = Decimal("999.0")
+            scan_stats = {
+                "rules": len(TOKEN_PAIRS), "price_missing": 0,
+                "balance_rejected": 0, "instrument_missing": 0,
+                "stack_guard": 0, "quote_errors": 0,
+                "fee_data_invalid": 0, "network_fee_rejected": 0,
+                "pool_fee_rejected": 0, "qualifying_quotes": 0,
+            }
+            rate_limit_hit = False
 
             for pair in TOKEN_PAIRS:
             
@@ -335,6 +415,11 @@ async def main():
                 net_max = pair["net_max"]
                 
                 pair_key = canonical_pair_key(token_a, token_b)
+
+                if token_a not in instruments or token_b not in instruments:
+                    scan_stats["instrument_missing"] += 1
+                    print(f" [SCAN] {pair_key}: instrument unavailable; skipping this scan.")
+                    continue
                 
                 if pair_key in _disabled_pairs and time.time() < _disabled_pairs[pair_key]:
                     continue
@@ -361,6 +446,7 @@ async def main():
                 
                 
                 if not a_price_cc or not b_price_cc:
+                    scan_stats["price_missing"] += 1
                     continue
 
                  # --- PING-PONG WITH FALLBACK (no hardcoding, honors DB order) ---
@@ -418,6 +504,7 @@ async def main():
                 # which loses round-trip rebate eligibility. Wait for the balance instead.
 
                 if not possible_directions:
+                    scan_stats["balance_rejected"] += 1
                     print(f"[SKIP] {token_a}/{token_b} — neither direction has ≥{MIN_SWAP_SIZE_CC} CC balance")
                     continue
 
@@ -431,6 +518,7 @@ async def main():
                     # For the last 3 swaps of the day, bypass it — the marginal
                     # accumulation is negligible and we don't want to miss a rebate.
                     if swaps_done < 22 and _net_cc_delta.get(buy, Decimal("0")) + req_cc > Decimal("200"):
+                        scan_stats["stack_guard"] += 1
                         print(f" [STACK GUARD] Skipping {sell}->{buy}. Too much {buy} stacked.")
                         continue
 
@@ -440,32 +528,54 @@ async def main():
                             sell_instrument=instruments[sell],
                             buy_instrument=instruments[buy],
                         )
-                        fees_obj = getattr(quote, "fees", None)
-                        network_fee = Decimal(str(fees_obj.network_fee.amount))
-                        pool_fee_percent = Decimal(str(getattr(fees_obj, "fee_percentage", 0))) * 100
-
-                        if (net_min <= network_fee <= net_max
-                                and POOL_MIN <= pool_fee_percent <= POOL_MAX
-                                and network_fee < lowest_fee):
-                            lowest_fee = network_fee
-                            best_opportunity = {
-                                "sell": sell,
-                                "buy": buy,
-                                "amount": req_sell,
-                                "dir": direction["dir"],
-                                "net_min": net_min,
-                                "net_max": net_max
-                            }
                     except Exception as e:
                         error_str = str(e).lower()
-                        if "429" in error_str or "rate limit" in error_str:
-                            print(" RATE LIMIT in scan. Cooling down 30s...")
-                            await asyncio.sleep(30)
+                        if "429" in error_str or "rate limit" in error_str or "too many requests" in error_str:
+                            print(" RATE LIMIT in scan. Cooling down 30s before the next scan...")
+                            rate_limit_hit = True
                             break
-                        
-                        print(f" Error on {pair_key}: {e}. Disabling pair for 5 minutes.")
-                        _disabled_pairs[pair_key] = time.time() + 300
-                        break
+
+                        scan_stats["quote_errors"] += 1
+                        print(f" [QUOTE ERROR] {sell}->{buy}: {e}. Keeping the pair active; checking other eligible directions.")
+                        continue
+
+                    fee_values = extract_quote_fees(quote)
+                    if fee_values is None:
+                        scan_stats["fee_data_invalid"] += 1
+                        print(f" [QUOTE REJECTED] {sell}->{buy}: missing or invalid fee data.")
+                        continue
+
+                    network_fee, pool_fee_percent = fee_values
+                    if not (net_min <= network_fee <= net_max):
+                        scan_stats["network_fee_rejected"] += 1
+                        continue
+                    if not (POOL_MIN <= pool_fee_percent <= POOL_MAX):
+                        scan_stats["pool_fee_rejected"] += 1
+                        continue
+
+                    scan_stats["qualifying_quotes"] += 1
+                    if network_fee < lowest_fee:
+                        lowest_fee = network_fee
+                        best_opportunity = {
+                            "sell": sell,
+                            "buy": buy,
+                            "amount": req_sell,
+                            "dir": direction["dir"],
+                            "net_min": net_min,
+                            "net_max": net_max
+                        }
+
+                if rate_limit_hit:
+                    break
+
+            print(
+                " [SCAN SUMMARY] "
+                + " | ".join(f"{key}={value}" for key, value in scan_stats.items())
+            )
+
+            if rate_limit_hit:
+                await asyncio.sleep(30)
+                continue
 
             if best_opportunity:
                 print(f" Best fee found: {lowest_fee} CC for {best_opportunity['sell']} -> {best_opportunity['buy']}")
