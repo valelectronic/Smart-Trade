@@ -107,6 +107,7 @@ def _allowance_remaining():
 
 
 def _activate_manual_lock(reason: str, tx_id=None):
+    """Persistent lock is reserved for low CC reserve or no funded swap direction."""
     global swap_halted
     swap_halted = True
     try:
@@ -410,9 +411,15 @@ async def check_and_swap(client, instruments, sell_token, buy_token, net_min, ne
         print(f" Could not fetch account info: {e}")
         return False
     cc_balance = get_cc_balance(account)
-    if cc_balance is not None and cc_balance < MIN_CC_BALANCE:
-        print(f" Low CC balance ({cc_balance} CC). Pausing to protect gas.")
+    if cc_balance is None:
+        print("[CC BALANCE WAIT] Could not read CC balance. Retrying on the next scan.")
         return False
+    if cc_balance < MIN_CC_BALANCE:
+        _activate_manual_lock(
+            f"CC balance is {cc_balance} CC, below the configured {MIN_CC_BALANCE} CC network-fee reserve. "
+            "Add CC, then clear the lock in the dashboard."
+        )
+        return "HALTED_MANUAL_INTERVENTION"
 
     cc_price, usd_price = get_prices_in_cc_and_usd(sell_token)
     if not cc_price or cc_price <= 0:
@@ -490,11 +497,12 @@ async def check_and_swap(client, instruments, sell_token, buy_token, net_min, ne
                 tx_id = result.get("id") if isinstance(result, dict) else None
                 verify_flag = result.get("verify") if isinstance(result, dict) else None
                 if not tx_id:
-                    _activate_manual_lock(
-                        "Swap submission response did not contain an ID; transaction outcome cannot be correlated safely.",
-                        tx_id=None
+                    print(
+                        "[SWAP RETRY] Submission response did not contain a transaction ID. "
+                        "No manual lock applied; waiting before the next scan."
                     )
-                    return "HALTED_MANUAL_INTERVENTION"
+                    await asyncio.sleep(POST_SWAP_COOLDOWN)
+                    return False
 
                 if verify_flag is not True:
                     print(
@@ -521,11 +529,13 @@ async def check_and_swap(client, instruments, sell_token, buy_token, net_min, ne
                     successful = False
 
                 if not successful:
-                    _activate_manual_lock(
-                        f"Transaction {tx_id} is unresolved or failed. Hunter will not submit another swap until owner reconciliation.",
-                        tx_id=tx_id
+                    print(
+                        f"[SWAP RETRY] Transaction {tx_id} was not confirmed as a complete route. "
+                        "It remains recorded for visibility, but it will not activate the manual lock. "
+                        f"Retrying after {POST_SWAP_COOLDOWN}s."
                     )
-                    return "HALTED_MANUAL_INTERVENTION"
+                    await asyncio.sleep(POST_SWAP_COOLDOWN)
+                    return False
 
                 end_time = time.perf_counter()
                 print(f" [LEDGER CONFIRMED] Swap completed in {end_time - start_time:.2f}s. TX ID: {tx_id}")
@@ -553,11 +563,13 @@ async def check_and_swap(client, instruments, sell_token, buy_token, net_min, ne
                             await asyncio.sleep(2 * (attempt + 1))
 
                 if db_error is not None:
-                    _activate_manual_lock(
-                        f"Cantex confirmed transaction {tx_id}, but DB logging failed after retries: {db_error}",
-                        tx_id=tx_id
+                    print(
+                        f"[DB LOG DELAYED] Cantex confirmed transaction {tx_id}, "
+                        f"but history logging failed after retries: {db_error}. "
+                        "No manual lock applied; the Hunter will retry on a later scan."
                     )
-                    return "HALTED_MANUAL_INTERVENTION"
+                    await asyncio.sleep(POST_SWAP_COOLDOWN)
+                    return False
 
                 if logged:
                     swaps_done += 1
@@ -589,11 +601,13 @@ async def check_and_swap(client, instruments, sell_token, buy_token, net_min, ne
 
                 return True
             except Exception as e:
-                print(f"[SWAP OUTCOME UNCERTAIN] {e}")
-                _activate_manual_lock(
-                    f"Swap call raised an exception; transaction outcome must be reconciled before another submission: {e}"
+                print(
+                    f"[SWAP RETRY] Swap submission/confirmation raised "
+                    f"{type(e).__name__}: {e}. No manual lock applied; "
+                    f"retrying after {POST_SWAP_COOLDOWN}s."
                 )
-                return "HALTED_MANUAL_INTERVENTION"
+                await asyncio.sleep(POST_SWAP_COOLDOWN)
+                return False
     else:
         return False
 
@@ -665,12 +679,16 @@ async def main():
 
         unresolved = get_unresolved_swaps()
         if unresolved:
-            first = unresolved[0]
-            _activate_manual_lock(
-                f"Unresolved transaction {first['tx_id']} found during startup; reconcile before new submissions.",
-                tx_id=first["tx_id"]
+            print(
+                f"[TRANSACTION TRACKING] {len(unresolved)} unresolved transaction(s) "
+                "remain in the database. They are retained for visibility, "
+                "but they will not block the Hunter from scanning."
             )
-            return "HALTED_MANUAL_INTERVENTION"
+            for item in unresolved:
+                print(
+                    f"[TRANSACTION TRACKING] tx_id={item.get('tx_id')} "
+                    f"status={item.get('status')} — monitoring continues."
+                )
 
         account_admin = await client.get_account_admin()
         instruments = {}
@@ -738,6 +756,20 @@ async def main():
 
             print(f" Active rules: {len(TOKEN_PAIRS)}")
 
+            try:
+                scan_account = await client.get_account_info()
+                scan_cc_balance = get_cc_balance(scan_account)
+                if scan_cc_balance is not None and scan_cc_balance < MIN_CC_BALANCE:
+                    _activate_manual_lock(
+                        f"CC balance is {scan_cc_balance} CC, below the configured "
+                        f"{MIN_CC_BALANCE} CC network-fee reserve. Add CC, then clear the lock in the dashboard."
+                    )
+                    break
+                if scan_cc_balance is None:
+                    print("[CC BALANCE WAIT] CC balance unavailable; continuing scan and retrying.")
+            except Exception as balance_err:
+                print(f"[CC BALANCE CHECK RETRY] {balance_err}. Continuing scan.")
+
             best_opportunity = None
             lowest_fee = Decimal("999.0")
             scan_stats = {
@@ -746,6 +778,7 @@ async def main():
                 "stack_guard": 0, "quote_errors": 0,
                 "fee_data_invalid": 0, "network_fee_rejected": 0,
                 "pool_fee_rejected": 0, "qualifying_quotes": 0,
+                "balance_evaluable_pairs": 0, "balance_eligible_directions": 0,
             }
             rate_limit_hit = False
 
@@ -791,7 +824,9 @@ async def main():
                     scan_stats["price_missing"] += 1
                     continue
 
-                 # Evaluate A->B and B->A independently on every scan.
+                scan_stats["balance_evaluable_pairs"] += 1
+
+                # Evaluate A->B and B->A independently on every scan.
                 # Previous swap direction does not force or prioritise either side.
                 possible_directions = []
 
@@ -809,6 +844,7 @@ async def main():
                     if (amount_to_sell * sell_price) < MIN_SWAP_SIZE_CC:
                         return
 
+                    scan_stats["balance_eligible_directions"] += 1
                     dir_label = "A_TO_B" if sell_tok == token_a else "B_TO_A"
                     possible_directions.append({
                         "sell": sell_tok,
@@ -902,10 +938,26 @@ async def main():
                             if key != "network_fee"
                         }
 
+            if swap_halted:
+                break
+
             print(
                 " [SCAN SUMMARY] "
                 + " | ".join(f"{key}={value}" for key, value in scan_stats.items())
             )
+
+            if (
+                scan_stats["balance_evaluable_pairs"] > 0
+                and scan_stats["balance_eligible_directions"] == 0
+            ):
+                reason = (
+                    f"No active market direction has enough unlocked token balance "
+                    f"to meet the {MIN_SWAP_SIZE_CC} CC minimum across "
+                    f"{scan_stats['balance_evaluable_pairs']} price-evaluable pair(s). "
+                    "Add funds or adjust active pairs, then clear the lock in the dashboard."
+                )
+                _activate_manual_lock(reason)
+                break
 
             if rate_limit_hit:
                 await asyncio.sleep(30)
