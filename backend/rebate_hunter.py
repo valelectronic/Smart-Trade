@@ -193,6 +193,26 @@ def _instrument_symbol(value):
     return str(value or "").upper()
 
 
+def _ledger_amount_matches(expected: Decimal, observed: Decimal) -> bool:
+    """Match SDK amounts despite Cantex ledger decimal precision truncation.
+
+    The submitted quote amount can contain more decimal places than the amount
+    emitted in Pool.SwapExecuted. Allow at most one unit of the least
+    significant decimal place actually present in either value. Route
+    uniqueness is still enforced separately, so this tolerance cannot silently
+    choose between multiple candidate legs.
+    """
+    expected = Decimal(str(expected))
+    observed = Decimal(str(observed))
+    if expected == observed:
+        return True
+
+    expected_quantum = Decimal(1).scaleb(expected.as_tuple().exponent)
+    observed_quantum = Decimal(1).scaleb(observed.as_tuple().exponent)
+    tolerance = max(abs(expected_quantum), abs(observed_quantum))
+    return abs(expected - observed) <= tolerance
+
+
 async def _private_event_reader(ws):
     """Continuously buffer private Cantex events; reconnect is handled by SDK wrapper."""
     async for event in ws:
@@ -336,7 +356,11 @@ async def _confirm_submitted_swap(tx_id, sell_token, buy_token, sell_amount):
                     out_amount = Decimal(str(leg.get("output_amount")))
                 except Exception:
                     continue
-                if in_symbol == current_symbol and in_amount == current_amount:
+                # Cantex may serialise the executed input amount at lower
+                # decimal precision than the SDK submission amount. Compare
+                # within one unit of the least significant reported decimal,
+                # rather than requiring impossible string-level equality.
+                if in_symbol == current_symbol and _ledger_amount_matches(current_amount, in_amount):
                     matches.append((leg, out_symbol, out_amount))
             if len(matches) != 1:
                 break
