@@ -44,6 +44,15 @@ async def connect_sdk():
 
 
 # ============================================================
+# PRIVATE WEBSOCKET
+# ============================================================
+
+async def connect_private_ws(client):
+    """Open an authenticated Cantex private WebSocket."""
+    return await client.connect_private_ws()
+
+
+# ============================================================
 # INSTRUMENT LOOKUP
 # ============================================================
 

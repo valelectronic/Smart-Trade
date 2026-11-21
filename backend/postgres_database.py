@@ -10,6 +10,7 @@ This code does not DROP an existing orders table or delete any existing data.
 """
 
 import os
+import json
 
 import psycopg2
 from psycopg2.extras import RealDictCursor
@@ -141,6 +142,33 @@ def init_db():
                         CHECK (swaps_remaining BETWEEN 0 AND 25),
                     updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
                 )
+                """
+            )
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS swap_transactions (
+                    tx_id TEXT PRIMARY KEY,
+                    sell_token TEXT NOT NULL,
+                    buy_token TEXT NOT NULL,
+                    sell_amount TEXT NOT NULL,
+                    status TEXT NOT NULL CHECK (
+                        status IN ('PENDING', 'SUCCESSFUL', 'FAILED', 'UNKNOWN')
+                    ),
+                    submission_response JSONB,
+                    pending_event JSONB,
+                    execution_events JSONB NOT NULL DEFAULT '[]'::jsonb,
+                    failure_event JSONB,
+                    error TEXT,
+                    submitted_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    confirmed_at TIMESTAMPTZ,
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+                """
+            )
+            cursor.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_swap_transactions_status
+                ON swap_transactions(status)
                 """
             )
             _ensure_control_row(cursor)
@@ -410,5 +438,169 @@ def get_active_hunter_rules():
                 """
             )
             return cursor.fetchall()
+    finally:
+        connection.close()
+
+
+# ---------------------------------------------------------------------------
+# Transaction lifecycle tracking. These records are separate from
+# rebate_swaps: only a verified SUCCESSFUL transaction enters rebate_swaps.
+# ---------------------------------------------------------------------------
+
+def create_pending_swap(tx_id, sell_token, buy_token, sell_amount, submission_response=None):
+    tx_id = str(tx_id or "").strip()
+    if not tx_id:
+        raise ValueError("tx_id cannot be empty")
+    connection = get_connection()
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                INSERT INTO swap_transactions
+                    (tx_id, sell_token, buy_token, sell_amount, status, submission_response)
+                VALUES (%s, %s, %s, %s, 'PENDING', %s::jsonb)
+                ON CONFLICT (tx_id) DO NOTHING
+                RETURNING tx_id
+                """,
+                (tx_id, str(sell_token), str(buy_token), str(sell_amount),
+                 json.dumps(submission_response, default=str) if submission_response is not None else None),
+            )
+            inserted = cursor.fetchone() is not None
+        connection.commit()
+        return inserted
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
+
+
+def update_swap_pending_event(tx_id, pending_event):
+    connection = get_connection()
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                UPDATE swap_transactions
+                SET pending_event = %s::jsonb, updated_at = NOW()
+                WHERE tx_id = %s AND status IN ('PENDING', 'UNKNOWN')
+                RETURNING tx_id
+                """,
+                (json.dumps(pending_event, default=str), str(tx_id)),
+            )
+            found = cursor.fetchone() is not None
+        connection.commit()
+        return found
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
+
+
+def add_swap_execution_event(tx_id, execution_event):
+    connection = get_connection()
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                UPDATE swap_transactions
+                SET execution_events = execution_events || %s::jsonb,
+                    updated_at = NOW()
+                WHERE tx_id = %s AND status IN ('PENDING', 'UNKNOWN')
+                RETURNING tx_id
+                """,
+                (json.dumps([execution_event], default=str), str(tx_id)),
+            )
+            found = cursor.fetchone() is not None
+        connection.commit()
+        return found
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
+
+
+def update_swap_transaction_status(tx_id, status, error=None):
+    status = str(status).upper()
+    if status not in {"PENDING", "SUCCESSFUL", "FAILED", "UNKNOWN"}:
+        raise ValueError("Invalid swap transaction status")
+    connection = get_connection()
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                UPDATE swap_transactions
+                SET status = %s,
+                    error = %s,
+                    confirmed_at = CASE
+                        WHEN %s IN ('SUCCESSFUL', 'FAILED') THEN NOW()
+                        ELSE confirmed_at
+                    END,
+                    updated_at = NOW()
+                WHERE tx_id = %s
+                RETURNING tx_id
+                """,
+                (status, error, status, str(tx_id)),
+            )
+            found = cursor.fetchone() is not None
+        connection.commit()
+        return found
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
+
+
+def update_swap_failure_event(tx_id, failure_event):
+    connection = get_connection()
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                UPDATE swap_transactions
+                SET failure_event = %s::jsonb, updated_at = NOW()
+                WHERE tx_id = %s AND status IN ('PENDING', 'UNKNOWN')
+                RETURNING tx_id
+                """,
+                (json.dumps(failure_event, default=str), str(tx_id)),
+            )
+            found = cursor.fetchone() is not None
+        connection.commit()
+        return found
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
+
+
+def get_unresolved_swaps():
+    connection = get_connection()
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT * FROM swap_transactions
+                WHERE status IN ('PENDING', 'UNKNOWN')
+                ORDER BY submitted_at ASC
+                """
+            )
+            return cursor.fetchall()
+    finally:
+        connection.close()
+
+
+def get_swap_transaction(tx_id):
+    connection = get_connection()
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT * FROM swap_transactions WHERE tx_id = %s",
+                (str(tx_id),),
+            )
+            return cursor.fetchone()
     finally:
         connection.close()

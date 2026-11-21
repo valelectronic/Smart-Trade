@@ -5,9 +5,15 @@ import httpx
 from decimal import Decimal
 import os
 from pathlib import Path
-from cantex_api import connect_sdk
+from cantex_api import connect_sdk, connect_private_ws
 from helpers import get_cc_balance
-from postgres_database import (get_today_swap_count, log_successful_swap, get_connection, get_hunter_control_state, activate_manual_intervention_lock)
+from postgres_database import (
+    get_today_swap_count, log_successful_swap, get_connection,
+    get_hunter_control_state, activate_manual_intervention_lock,
+    create_pending_swap, update_swap_pending_event,
+    add_swap_execution_event, update_swap_transaction_status,
+    update_swap_failure_event, get_unresolved_swaps,
+)
 from datetime import datetime, timezone, timedelta
 
 def canonical_pair_key(token_a: str, token_b: str) -> str:
@@ -87,6 +93,10 @@ execution_lock = asyncio.Lock()
 _last_swap_direction = {} 
 _disabled_pairs = {} 
 _net_cc_delta = {}
+_event_queue = asyncio.Queue()
+_private_ws_task = None
+PRIVATE_EVENT_TIMEOUT = 45
+EXECUTION_SETTLE_SECONDS = 3
 
 def _allowance_remaining():
     state = get_hunter_control_state()
@@ -104,6 +114,16 @@ def _activate_manual_lock(reason: str, tx_id=None):
         print(f"[MANUAL INTERVENTION LOCK] {reason}")
     except Exception as db_err:
         print(f"[CRITICAL] Could not persist manual lock: {db_err}")
+
+
+def _mark_swap_unknown(tx_id, reason: str):
+    """Persist and log the precise reason a submitted swap remains unresolved."""
+    message = f"[SWAP UNKNOWN] tx_id={tx_id} reason={reason}"
+    print(message)
+    try:
+        update_swap_transaction_status(tx_id, "UNKNOWN", reason)
+    except Exception as db_err:
+        print(f"[CRITICAL] Could not persist UNKNOWN status for {tx_id}: {db_err}")
 
 
 def extract_quote_fees(quote):
@@ -158,6 +178,189 @@ def get_prices_in_cc_and_usd(token_symbol):
         return token_cc_price, token_usd_price
     except Exception:
         return None, None
+
+
+def _event_raw(event):
+    raw = getattr(event, "raw", None)
+    if isinstance(raw, dict):
+        return raw
+    return {}
+
+
+def _instrument_symbol(value):
+    if isinstance(value, dict):
+        return str(value.get("id") or "").upper()
+    return str(value or "").upper()
+
+
+async def _private_event_reader(ws):
+    """Continuously buffer private Cantex events; reconnect is handled by SDK wrapper."""
+    async for event in ws:
+        raw = _event_raw(event)
+        event_type = raw.get("type") or getattr(event, "event_type", None)
+        if event_type in ("Pool.SwapPending", "Pool.SwapExecuted", "Pool.SwapFailed"):
+            await _event_queue.put(raw)
+
+
+async def _next_event_until(deadline):
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        return None
+    try:
+        return await asyncio.wait_for(_event_queue.get(), timeout=remaining)
+    except asyncio.TimeoutError:
+        return None
+
+
+async def _confirm_submitted_swap(tx_id, sell_token, buy_token, sell_amount):
+    """Correlate pending by exact SDK ID; confirm only a unique, complete route.
+
+    SwapExecuted has no swap ID. Therefore execution events are accepted only
+    when wallet/user match the pending event and their ledger route uniquely
+    reconstructs the requested input-to-output path within this isolated window.
+    Any ambiguity remains UNKNOWN.
+    """
+    deadline = time.monotonic() + PRIVATE_EVENT_TIMEOUT
+    pending = None
+    executions = []
+
+    while time.monotonic() < deadline:
+        raw = await _next_event_until(deadline)
+        if raw is None:
+            break
+        data = raw.get("data") or {}
+        typ = raw.get("type")
+
+        if typ == "Pool.SwapPending" and str(data.get("id")) == str(tx_id):
+            pending = raw
+            update_swap_pending_event(tx_id, raw)
+            break
+
+    if pending is None:
+        _mark_swap_unknown(
+            tx_id,
+            "No SwapPending event with the exact SDK submission ID was observed."
+        )
+        return False
+
+    pending_data = pending.get("data") or {}
+    pending_user = str(pending.get("user_id") or "")
+    pending_wallet = str(pending.get("wallet_address") or "")
+    expected_sell = _instrument_symbol(pending_data.get("input_instrument_id"))
+    expected_buy = _instrument_symbol(pending_data.get("output_instrument_id"))
+
+    if expected_sell != str(sell_token).upper() or expected_buy != str(buy_token).upper():
+        _mark_swap_unknown(
+            tx_id, "Pending event instruments do not match submitted pair. "
+            f"pending={expected_sell}->{expected_buy}, submitted={str(sell_token).upper()}->{str(buy_token).upper()}"
+        )
+        return False
+
+    # Collect all execution/failure events in the confirmation window.
+    while time.monotonic() < deadline:
+        raw = await _next_event_until(deadline)
+        if raw is None:
+            break
+        if raw.get("user_id") != pending_user or raw.get("wallet_address") != pending_wallet:
+            continue
+        typ = raw.get("type")
+        data = raw.get("data") or {}
+        if typ == "Pool.SwapFailed":
+            if str(data.get("id")) == str(tx_id):
+                update_swap_failure_event(tx_id, raw)
+                update_swap_transaction_status(tx_id, "FAILED", "Matching SwapFailed event received.")
+                print(f"[SWAP FAILED] tx_id={tx_id} matching Pool.SwapFailed event received.")
+                return False
+        elif typ == "Pool.SwapExecuted":
+            details = data.get("swap_details") or {}
+            executions.append(raw)
+            add_swap_execution_event(tx_id, raw)
+
+            # Wait briefly for other legs emitted with the same ledger timestamp.
+            ledger_ts = data.get("ledger_created_at")
+            if ledger_ts:
+                settle_deadline = time.monotonic() + EXECUTION_SETTLE_SECONDS
+                while time.monotonic() < settle_deadline:
+                    extra = await _next_event_until(settle_deadline)
+                    if extra is None:
+                        break
+                    if extra.get("user_id") == pending_user and extra.get("wallet_address") == pending_wallet:
+                        if extra.get("type") == "Pool.SwapExecuted":
+                            extra_data = extra.get("data") or {}
+                            if extra_data.get("ledger_created_at") == ledger_ts:
+                                executions.append(extra)
+                                add_swap_execution_event(tx_id, extra)
+                                # Start the quiet window again after each matching route leg.
+                                settle_deadline = time.monotonic() + EXECUTION_SETTLE_SECONDS
+                        elif extra.get("type") == "Pool.SwapFailed":
+                            if str((extra.get("data") or {}).get("id")) == str(tx_id):
+                                update_swap_failure_event(tx_id, extra)
+                                update_swap_transaction_status(tx_id, "FAILED", "Matching SwapFailed event received.")
+                                print(f"[SWAP FAILED] tx_id={tx_id} matching Pool.SwapFailed event received.")
+                                return False
+                break
+
+    if not executions:
+        _mark_swap_unknown(
+            tx_id, "No matching SwapExecuted events observed before timeout."
+        )
+        return False
+
+    # A Cantex routed swap emits sequential legs sharing ledger_created_at.
+    # Reconstruct a single unambiguous chain from the pending input to output.
+    groups = {}
+    for event in executions:
+        data = event.get("data") or {}
+        details = data.get("swap_details") or {}
+        ts = data.get("ledger_created_at")
+        if not ts:
+            continue
+        groups.setdefault(ts, []).append(details)
+
+    valid_groups = []
+    for ts, legs in groups.items():
+        # Route ordering is inferred by amount continuity, not event arrival order.
+        remaining = list(legs)
+        current_symbol = expected_sell
+        current_amount = Decimal(str(sell_amount))
+        chain = []
+        while remaining:
+            matches = []
+            for leg in remaining:
+                inp = leg.get("input_instrument_id") or {}
+                out = leg.get("output_instrument_id") or {}
+                in_symbol = _instrument_symbol(inp)
+                out_symbol = _instrument_symbol(out)
+                try:
+                    in_amount = Decimal(str(leg.get("input_amount")))
+                    out_amount = Decimal(str(leg.get("output_amount")))
+                except Exception:
+                    continue
+                if in_symbol == current_symbol and in_amount == current_amount:
+                    matches.append((leg, out_symbol, out_amount))
+            if len(matches) != 1:
+                break
+            leg, current_symbol, current_amount = matches[0]
+            chain.append(leg)
+            remaining.remove(leg)
+            if current_symbol == expected_buy:
+                if not remaining:
+                    valid_groups.append((ts, chain, current_amount))
+                break
+
+    if len(valid_groups) != 1:
+        _mark_swap_unknown(
+            tx_id,
+            "Execution events could not be reconstructed into one unique complete route. "
+            f"execution_event_count={len(executions)}, ledger_groups={len(groups)}, "
+            f"valid_routes={len(valid_groups)}"
+        )
+        return False
+
+    _, chain, final_amount = valid_groups[0]
+    update_swap_transaction_status(tx_id, "SUCCESSFUL")
+    return True
+
 
 async def check_and_swap(client, instruments, sell_token, buy_token, net_min, net_max, sell_amount_tokens, pair_key=None, direction=None):
     global swaps_done, swap_halted
@@ -259,25 +462,50 @@ async def check_and_swap(client, instruments, sell_token, buy_token, net_min, ne
                     sell_instrument=instruments[sell_token],
                     buy_instrument=instruments[buy_token],
                 )
-                
+
                 tx_id = result.get("id") if isinstance(result, dict) else None
-                confirmed = bool(result and isinstance(result, dict) and result.get("verify"))
-                if not confirmed:
+                verify_flag = result.get("verify") if isinstance(result, dict) else None
+                if not tx_id:
                     _activate_manual_lock(
-                        "Cantex did not confirm the swap response. Execution outcome is uncertain.",
+                        "Swap submission response did not contain an ID; transaction outcome cannot be correlated safely.",
+                        tx_id=None
+                    )
+                    return "HALTED_MANUAL_INTERVENTION"
+
+                if verify_flag is not True:
+                    print(
+                        f"[SUBMISSION WARNING] tx_id={tx_id} verify={verify_flag!r}. "
+                        "The ID is available, so the Hunter will check matching ledger events "
+                        "rather than treating this flag alone as proof of failure."
+                    )
+
+                create_pending_swap(
+                    tx_id=tx_id,
+                    sell_token=sell_token,
+                    buy_token=buy_token,
+                    sell_amount=str(sell_amount_tokens),
+                    submission_response=result,
+                )
+                print(f" [SUBMITTED] TX ID: {tx_id}; awaiting ledger execution events.")
+
+                try:
+                    successful = await _confirm_submitted_swap(
+                        tx_id, sell_token, buy_token, sell_amount_tokens
+                    )
+                except Exception as confirm_err:
+                    _mark_swap_unknown(tx_id, f"Confirmation processing error: {confirm_err}")
+                    successful = False
+
+                if not successful:
+                    _activate_manual_lock(
+                        f"Transaction {tx_id} is unresolved or failed. Hunter will not submit another swap until owner reconciliation.",
                         tx_id=tx_id
                     )
                     return "HALTED_MANUAL_INTERVENTION"
 
                 end_time = time.perf_counter()
-                print(f" SWAP CONFIRMED in {end_time - start_time:.2f}s! TX ID: {tx_id}")
-                if not tx_id:
-                    _activate_manual_lock(
-                        "Cantex confirmed a swap but returned no transaction ID; safe deduplication is impossible."
-                    )
-                    return "HALTED_MANUAL_INTERVENTION"
+                print(f" [LEDGER CONFIRMED] Swap completed in {end_time - start_time:.2f}s. TX ID: {tx_id}")
 
-                # Record confirmed execution before checking wallet balances.
                 logged = False
                 db_error = None
                 for attempt in range(3):
@@ -321,43 +549,27 @@ async def check_and_swap(client, instruments, sell_token, buy_token, net_min, ne
                 _net_cc_delta[sell_token] = _net_cc_delta.get(sell_token, Decimal("0")) - (sell_amount_tokens * cc_price)
                 _net_cc_delta[buy_token] = _net_cc_delta.get(buy_token, Decimal("0")) + (sell_amount_tokens * cc_price)
 
-                verified_balance = False
-                verify_error = None
-                for attempt in range(3):
-                    try:
-                        await asyncio.sleep(POST_SWAP_COOLDOWN if attempt == 0 else 5)
-                        account_after = await client.get_account_info()
-                        balance_after = Decimal("0")
-                        found = False
-                        for item in getattr(account_after, "tokens", []) or []:
-                            sym = getattr(item, "instrument_symbol", None)
-                            if sym and str(sym).upper() == sell_token:
-                                balance_after = Decimal(str(getattr(item, "unlocked_amount", 0)))
-                                found = True
-                                break
-                        if found:
-                            actual_decrease = current_balance - balance_after
-                            if actual_decrease >= sell_amount_tokens * Decimal("0.99"):
-                                verified_balance = True
-                                break
-                            verify_error = f"Expected decrease {sell_amount_tokens}; observed {actual_decrease}."
-                        else:
-                            verify_error = f"{sell_token} missing from refreshed account balances."
-                    except Exception as err:
-                        verify_error = str(err)
-                    print(f"[BALANCE VERIFY RETRY {attempt + 1}/3] {verify_error}")
-
-                if not verified_balance:
-                    _activate_manual_lock(
-                        f"Confirmed transaction {tx_id} is recorded, but wallet verification remains inconsistent: {verify_error}",
-                        tx_id=tx_id
+                # Pool.SwapExecuted / SDK submission confirmation is the execution
+                # signal. Wallet balances can lag behind the ledger, so refresh them
+                # for the next decision but never reverse a confirmed swap or lock
+                # the Hunter solely because this read is stale.
+                await asyncio.sleep(POST_SWAP_COOLDOWN)
+                try:
+                    account_after = await client.get_account_info()
+                    print("[BALANCE REFRESH] Account snapshot refreshed after confirmed swap.")
+                except Exception as refresh_err:
+                    print(
+                        f"[BALANCE REFRESH DELAYED] Swap {tx_id} is confirmed and logged; "
+                        f"account snapshot will be retried on the next scan: {refresh_err}"
                     )
-                    return "HALTED_MANUAL_INTERVENTION"
 
                 return True
             except Exception as e:
-                print(f" Swap Failed: {e}")
-                return False
+                print(f"[SWAP OUTCOME UNCERTAIN] {e}")
+                _activate_manual_lock(
+                    f"Swap call raised an exception; transaction outcome must be reconciled before another submission: {e}"
+                )
+                return "HALTED_MANUAL_INTERVENTION"
     else:
         return False
 
@@ -394,7 +606,7 @@ async def fetch_active_hunter_rules():
 async def main():
     global swaps_done, swap_halted
     swap_halted = False
-    print(" Starting Rebate Hunter (Dynamic 100-102 CC + Strict Ping-Pong)...")
+    print(" Starting Rebate Hunter (Dynamic 100-102 CC + Bidirectional Opportunity Scan)...")
 
     try:
         remaining, control_state = _allowance_remaining()
@@ -423,6 +635,19 @@ async def main():
     client = await connect_sdk()
     
     try:
+        global _private_ws_task
+        private_ws = await connect_private_ws(client)
+        _private_ws_task = asyncio.create_task(_private_event_reader(private_ws))
+
+        unresolved = get_unresolved_swaps()
+        if unresolved:
+            first = unresolved[0]
+            _activate_manual_lock(
+                f"Unresolved transaction {first['tx_id']} found during startup; reconcile before new submissions.",
+                tx_id=first["tx_id"]
+            )
+            return "HALTED_MANUAL_INTERVENTION"
+
         account_admin = await client.get_account_admin()
         instruments = {}
         for item in getattr(account_admin, "instruments", []) or []:
@@ -542,34 +767,21 @@ async def main():
                     scan_stats["price_missing"] += 1
                     continue
 
-                 # --- PING-PONG WITH FALLBACK (no hardcoding, honors DB order) ---
-                last_dir = _last_swap_direction.get(pair_key)
-
-                forced_dir = None
-                if last_dir == "A_TO_B":
-                    forced_dir = "B_TO_A"
-                elif last_dir == "B_TO_A":
-                    forced_dir = "A_TO_B"
-
+                 # Evaluate A->B and B->A independently on every scan.
+                # Previous swap direction does not force or prioritise either side.
                 possible_directions = []
 
                 def try_direction(sell_tok, buy_tok, sell_bal, sell_price):
-                    """Helper: adds a direction to possible_directions if balance ≥ MIN_SWAP_SIZE_CC.
-                    Targets TARGET_SWAP_SIZE_CC, capped at MAX, floored at MIN."""
+                    """Add a direction when its actual sell-token balance qualifies."""
                     if sell_price is None or sell_price <= 0:
                         return
                     if (sell_bal * sell_price) < MIN_SWAP_SIZE_CC:
                         return
 
-                    # Target 101.5 CC worth of tokens, but never sell more than we have
                     target_amount = TARGET_SWAP_SIZE_CC / sell_price
                     amount_to_sell = min(sell_bal, target_amount)
-
-                    # Hard cap at MAX (capital ceiling)
                     if (amount_to_sell * sell_price) > MAX_SWAP_SIZE_CC:
                         amount_to_sell = (MAX_SWAP_SIZE_CC / sell_price).quantize(Decimal("0.0001"))
-
-                    # Hard floor at MIN (rebate eligibility)
                     if (amount_to_sell * sell_price) < MIN_SWAP_SIZE_CC:
                         return
 
@@ -581,26 +793,18 @@ async def main():
                         "dir": dir_label,
                     })
 
-                # 1. Try the forced (reverse of last swap) direction first
-                if forced_dir == "A_TO_B":
-                    try_direction(token_a, token_b, balance_a, a_price_cc)
-                elif forced_dir == "B_TO_A":
-                    try_direction(token_b, token_a, balance_b, b_price_cc)
-                else:
-                    # No history — try A→B first, then B→A
-                    try_direction(token_a, token_b, balance_a, a_price_cc)
-                    if not possible_directions:
-                        try_direction(token_b, token_a, balance_b, b_price_cc)
-
-                # 2. NO FALLBACK. If the forced direction has no balance, skip the pair.
-                # Doing the same direction as the last swap creates a double-forward,
-                # which loses round-trip rebate eligibility. Wait for the balance instead.
+                # Always assess both directions. A previous rejection is not
+                # carried forward; balances and market conditions are re-read
+                # on the next scan and after every confirmed swap.
+                try_direction(token_a, token_b, balance_a, a_price_cc)
+                try_direction(token_b, token_a, balance_b, b_price_cc)
 
                 if not possible_directions:
                     scan_stats["balance_rejected"] += 1
-                    print(f"[SKIP] {token_a}/{token_b} — neither direction has ≥{MIN_SWAP_SIZE_CC} CC balance")
+                    print(f"[BALANCE WAIT] {token_a}/{token_b} — neither direction currently has ≥{MIN_SWAP_SIZE_CC} CC available. Will recheck.")
                     continue
 
+                pair_opportunities = []
                 for direction in possible_directions:
                     sell = direction["sell"]
                     buy = direction["buy"]
@@ -647,19 +851,32 @@ async def main():
                         continue
 
                     scan_stats["qualifying_quotes"] += 1
-                    if network_fee < lowest_fee:
-                        lowest_fee = network_fee
-                        best_opportunity = {
-                            "sell": sell,
-                            "buy": buy,
-                            "amount": req_sell,
-                            "dir": direction["dir"],
-                            "net_min": net_min,
-                            "net_max": net_max
-                        }
+                    pair_opportunities.append({
+                        "sell": sell,
+                        "buy": buy,
+                        "amount": req_sell,
+                        "dir": direction["dir"],
+                        "net_min": net_min,
+                        "net_max": net_max,
+                        "network_fee": network_fee,
+                    })
 
                 if rate_limit_hit:
                     break
+
+                if pair_opportunities:
+                    # If both directions qualify, choose the lower network-fee
+                    # opportunity. Direction history does not override live quotes.
+                    pair_choice = min(
+                        pair_opportunities,
+                        key=lambda item: item["network_fee"],
+                    )
+                    if pair_choice["network_fee"] < lowest_fee:
+                        lowest_fee = pair_choice["network_fee"]
+                        best_opportunity = {
+                            key: value for key, value in pair_choice.items()
+                            if key != "network_fee"
+                        }
 
             print(
                 " [SCAN SUMMARY] "
@@ -712,6 +929,12 @@ async def main():
     except KeyboardInterrupt:
         print("\n Stopped by user.")
     finally:
+        if _private_ws_task and not _private_ws_task.done():
+            _private_ws_task.cancel()
+            try:
+                await _private_ws_task
+            except asyncio.CancelledError:
+                pass
         close = getattr(client, "close", None)
         if close:
             result = close()
