@@ -601,11 +601,24 @@ async def check_and_swap(client, instruments, sell_token, buy_token, net_min, ne
 
                 return True
             except Exception as e:
-                print(
-                    f"[SWAP RETRY] Swap submission/confirmation raised "
-                    f"{type(e).__name__}: {e}. No manual lock applied; "
-                    f"retrying after {POST_SWAP_COOLDOWN}s."
-                )
+                error_text = str(e).lower()
+                if (
+                    pair_key
+                    and "token swapping is currently disabled" in error_text
+                ):
+                    disabled_until = time.time() + 300
+                    _disabled_pairs[pair_key] = disabled_until
+                    print(
+                        f"[PAIR TEMPORARILY SKIPPED] {pair_key}: Cantex reports "
+                        f"that token swapping is disabled. Skipping this pair "
+                        f"for 5 minutes; other eligible markets remain active."
+                    )
+                else:
+                    print(
+                        f"[SWAP RETRY] Swap submission/confirmation raised "
+                        f"{type(e).__name__}: {e}. No manual lock applied; "
+                        f"retrying after {POST_SWAP_COOLDOWN}s."
+                    )
                 await asyncio.sleep(POST_SWAP_COOLDOWN)
                 return False
     else:
@@ -796,8 +809,11 @@ async def main():
                     print(f" [SCAN] {pair_key}: instrument unavailable; skipping this scan.")
                     continue
                 
-                if pair_key in _disabled_pairs and time.time() < _disabled_pairs[pair_key]:
-                    continue
+                if pair_key in _disabled_pairs:
+                    if time.time() < _disabled_pairs[pair_key]:
+                        continue
+                    _disabled_pairs.pop(pair_key, None)
+                    print(f"[PAIR RECHECK] Temporary skip expired for {pair_key}; checking it again.")
                 
                 try:
                     account = await client.get_account_info()
