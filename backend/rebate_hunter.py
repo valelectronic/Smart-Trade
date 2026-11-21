@@ -842,8 +842,11 @@ async def main():
 
                 scan_stats["balance_evaluable_pairs"] += 1
 
-                # Evaluate A->B and B->A independently on every scan.
-                # Previous swap direction does not force or prioritise either side.
+                # Evaluate both directions, then enforce strict A/B alternation
+                # after the first confirmed swap for this pair. A successful A->B
+                # must be followed by B->A, and vice versa. If the required reverse
+                # direction is not currently balance-eligible or does not qualify
+                # on fees/stack guard, wait; never repeat the previous direction.
                 possible_directions = []
 
                 def try_direction(sell_tok, buy_tok, sell_bal, sell_price):
@@ -869,11 +872,36 @@ async def main():
                         "dir": dir_label,
                     })
 
-                # Always assess both directions. A previous rejection is not
-                # carried forward; balances and market conditions are re-read
-                # on the next scan and after every confirmed swap.
+                # Re-read both balances on every scan. Once a swap has been
+                # confirmed, however, only the opposite direction may execute.
                 try_direction(token_a, token_b, balance_a, a_price_cc)
                 try_direction(token_b, token_a, balance_b, b_price_cc)
+
+                pair_key_for_direction = canonical_pair_key(token_a, token_b)
+                last_direction = _last_swap_direction.get(pair_key_for_direction)
+                if last_direction == "A_TO_B":
+                    required_direction = "B_TO_A"
+                elif last_direction == "B_TO_A":
+                    required_direction = "A_TO_B"
+                else:
+                    required_direction = None
+
+                if required_direction:
+                    required_opportunities = [
+                        item for item in possible_directions
+                        if item["dir"] == required_direction
+                    ]
+                    if not required_opportunities:
+                        available = ", ".join(
+                            f"{item['sell']}->{item['buy']}" for item in possible_directions
+                        ) or "neither direction"
+                        print(
+                            f"[ALTERNATION WAIT] {token_a}/{token_b}: last confirmed direction "
+                            f"was {last_direction}; waiting for {required_direction}. "
+                            f"Currently balance-eligible: {available}."
+                        )
+                        continue
+                    possible_directions = required_opportunities
 
                 if not possible_directions:
                     scan_stats["balance_rejected"] += 1
@@ -941,8 +969,10 @@ async def main():
                     break
 
                 if pair_opportunities:
-                    # If both directions qualify, choose the lower network-fee
-                    # opportunity. Direction history does not override live quotes.
+                    # If this is the pair's first confirmed swap, either
+                    # qualifying direction may be selected by lowest network fee.
+                    # After that, the alternation filter above leaves only the
+                    # required reverse direction eligible.
                     pair_choice = min(
                         pair_opportunities,
                         key=lambda item: item["network_fee"],
