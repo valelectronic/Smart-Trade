@@ -148,6 +148,7 @@ def init_db():
                 """
                 CREATE TABLE IF NOT EXISTS swap_transactions (
                     tx_id TEXT PRIMARY KEY,
+                    pair_key TEXT,
                     sell_token TEXT NOT NULL,
                     buy_token TEXT NOT NULL,
                     sell_amount TEXT NOT NULL,
@@ -165,6 +166,9 @@ def init_db():
                 )
                 """
             )
+            cursor.execute("ALTER TABLE swap_transactions ADD COLUMN IF NOT EXISTS pair_key TEXT")
+            cursor.execute("CREATE TABLE IF NOT EXISTS swap_execution_events (id BIGSERIAL PRIMARY KEY, event_id TEXT, event_type TEXT NOT NULL, payload JSONB NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_swap_execution_events_created ON swap_execution_events(created_at DESC)")
             cursor.execute(
                 """
                 CREATE INDEX IF NOT EXISTS idx_swap_transactions_status
@@ -457,12 +461,12 @@ def create_pending_swap(tx_id, sell_token, buy_token, sell_amount, submission_re
             cursor.execute(
                 """
                 INSERT INTO swap_transactions
-                    (tx_id, sell_token, buy_token, sell_amount, status, submission_response)
-                VALUES (%s, %s, %s, %s, 'PENDING', %s::jsonb)
+                    (tx_id, pair_key, sell_token, buy_token, sell_amount, status, submission_response)
+                VALUES (%s, %s, %s, %s, %s, 'PENDING', %s::jsonb)
                 ON CONFLICT (tx_id) DO NOTHING
                 RETURNING tx_id
                 """,
-                (tx_id, str(sell_token), str(buy_token), str(sell_amount),
+                (tx_id, f"{str(sell_token).upper()}::{str(buy_token).upper()}", str(sell_token), str(buy_token), str(sell_amount),
                  json.dumps(submission_response, default=str) if submission_response is not None else None),
             )
             inserted = cursor.fetchone() is not None
@@ -602,5 +606,27 @@ def get_swap_transaction(tx_id):
                 (str(tx_id),),
             )
             return cursor.fetchone()
+    finally:
+        connection.close()
+
+
+def log_execution_event(event):
+    """Persist a raw Cantex execution event without correlating it to a swap submission."""
+    event = event if isinstance(event, dict) else {"raw": str(event)}
+    data = event.get("data") or {}
+    event_id = data.get("id") or event.get("id")
+    connection = get_connection()
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "INSERT INTO swap_execution_events (event_id, event_type, payload) VALUES (%s, %s, %s::jsonb)",
+                (str(event_id) if event_id is not None else None,
+                 str(event.get("type") or "Pool.SwapExecuted"), json.dumps(event, default=str)),
+            )
+        connection.commit()
+        return True
+    except Exception:
+        connection.rollback()
+        raise
     finally:
         connection.close()
