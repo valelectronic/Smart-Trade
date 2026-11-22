@@ -10,7 +10,7 @@ from pathlib import Path
 import websockets
 from dotenv import load_dotenv
 
-from cantex_api import connect_sdk, discover_market
+from cantex_api import discover_market
 from postgres_database import get_active_hunter_rules
 from helpers import dec, now_iso
 
@@ -26,9 +26,6 @@ BTC_MARKET_SYMBOL = "BTC-USDC"
 
 # Hunter rule refresh
 RULE_FALLBACK_REFRESH_SECONDS = 900  # 15 minutes
-
-# Wallet market refresh
-WALLET_REFRESH_SECONDS = 300  # 5 minutes
 
 # Retry failed discovery without querying continuously
 DISCOVERY_RETRY_SECONDS = 30
@@ -150,61 +147,13 @@ async def discover_hunter_channels():
         return None
 
 
-async def discover_wallet_channels(client):
-    """Return markets for the top five wallet tokens, or None on failure."""
-    market_channels = {}
+async def discover_wallet_channels(client=None):
+    """Wallet holdings are not a source of market subscriptions.
 
-    try:
-        account = await client.get_account_info()
-        balances = []
-
-        for item in getattr(account, "tokens", []) or []:
-            symbol = getattr(item, "instrument_symbol", None)
-            unlocked = getattr(item, "unlocked_amount", None)
-
-            if symbol and unlocked is not None and float(unlocked) > 0:
-                token = str(symbol).upper()
-
-                if token == "CC":
-                    continue
-
-                balances.append((token, float(unlocked)))
-
-        # Preserve the existing selection logic: top five by raw balance.
-        balances.sort(key=lambda item: item[1], reverse=True)
-        top_tokens = [item[0] for item in balances[:5]]
-
-        for token in top_tokens:
-            market_symbol = f"{token}-CC"
-
-            if market_symbol in market_channels:
-                continue
-
-            try:
-                _, channel = await asyncio.to_thread(
-                    discover_market, market_symbol
-                )
-
-                market_channels[market_symbol] = channel
-
-                print(
-                    f"[WALLET] Verified: "
-                    f"{market_symbol}; ticker={channel}"
-                )
-
-            except Exception as exc:
-                print(
-                    f"[WALLET ERROR] Could not discover "
-                    f"{market_symbol}: {exc}"
-                )
-                # Do not replace the previous complete wallet set.
-                return None
-
-        return market_channels
-
-    except Exception as exc:
-        print(f"[WALLET FETCH ERROR] {exc}")
-        return None
+    Kept as an empty compatibility function. Only active Hunter rules
+    determine which token markets are monitored.
+    """
+    return {}
 
 
 def get_rule_change_stamp():
@@ -219,8 +168,6 @@ def get_rule_change_stamp():
 
 
 async def run_monitor():
-    client = await connect_sdk()
-
     rate_channel = f"market.{RATE_MARKET_SYMBOL}.ticker"
     btc_channel = f"market.{BTC_MARKET_SYMBOL}.ticker"
 
@@ -228,19 +175,15 @@ async def run_monitor():
 
     # Last successful discovery times.
     last_rule_refresh = 0.0
-    last_wallet_refresh = 0.0
 
     # Last attempt times throttle retries after failures.
     last_rule_attempt = 0.0
-    last_wallet_attempt = 0.0
 
     rule_discovery_failed = False
-    wallet_discovery_failed = False
 
     last_seen_rule_change = get_rule_change_stamp()
 
     rule_channels = {}
-    wallet_channels = {}
     market_channels = {}
 
     reconnect_delay = INITIAL_RECONNECT_SECONDS
@@ -278,24 +221,10 @@ async def run_monitor():
             "Existing subscriptions, if any, will be preserved and retried."
         )
 
-    last_wallet_attempt = time.monotonic()
-    initial_wallet = await discover_wallet_channels(client)
-
-    if initial_wallet is not None:
-        wallet_channels = initial_wallet
-        last_wallet_refresh = time.monotonic()
-    else:
-        wallet_discovery_failed = True
-        print(
-            "[WALLET] Initial discovery failed. "
-            "Existing subscriptions, if any, will be preserved and retried."
-        )
-
     while True:
-        market_channels = {
-            **rule_channels,
-            **wallet_channels,
-        }
+        # Only active Hunter rules determine market subscriptions.
+        # With no active rules, subscribe to reference channels only.
+        market_channels = {**rule_channels}
 
         subscribed_channels = sorted(
             set(market_channels.values()) | {rate_channel, btc_channel}
@@ -393,55 +322,30 @@ async def run_monitor():
                                     f"{sorted(new_rule_channels.keys())}"
                                 )
 
+                                removed_markets = sorted(
+                                    set(rule_channels) - set(new_rule_channels)
+                                )
+                                added_markets = sorted(
+                                    set(new_rule_channels) - set(rule_channels)
+                                )
+
+                                if removed_markets:
+                                    print(
+                                        f"[HUNTER] Dropping removed market "
+                                        f"subscriptions: {removed_markets}"
+                                    )
+                                if added_markets:
+                                    print(
+                                        f"[HUNTER] Adding market subscriptions: "
+                                        f"{added_markets}"
+                                    )
+
                                 rule_channels = new_rule_channels
                                 subscription_changed = True
                         else:
                             rule_discovery_failed = True
                             print(
                                 "[HUNTER] Discovery failed. "
-                                "Keeping existing subscriptions."
-                            )
-
-                    # ---------------------------------
-                    # WALLET MARKET REFRESH
-                    # ---------------------------------
-
-                    wallet_refresh_due = (
-                        last_wallet_refresh == 0
-                        or now - last_wallet_refresh
-                        >= WALLET_REFRESH_SECONDS
-                    )
-
-                    wallet_retry_due = (
-                        last_wallet_attempt == 0
-                        or now - last_wallet_attempt
-                        >= DISCOVERY_RETRY_SECONDS
-                    )
-
-                    if wallet_refresh_due and (
-                        not wallet_discovery_failed or wallet_retry_due
-                    ):
-                        last_wallet_attempt = time.monotonic()
-
-                        new_wallet_channels = (
-                            await discover_wallet_channels(client)
-                        )
-
-                        if new_wallet_channels is not None:
-                            last_wallet_refresh = time.monotonic()
-                            wallet_discovery_failed = False
-
-                            if new_wallet_channels != wallet_channels:
-                                print(
-                                    "[WALLET] Wallet market subscriptions changed."
-                                )
-
-                                wallet_channels = new_wallet_channels
-                                subscription_changed = True
-                        else:
-                            wallet_discovery_failed = True
-                            print(
-                                "[WALLET] Discovery failed. "
                                 "Keeping existing subscriptions."
                             )
 
@@ -512,7 +416,7 @@ async def run_monitor():
                         continue
 
                     # ---------------------------------
-                    # HUNTER AND WALLET MARKET PRICES
+                    # HUNTER MARKET PRICES
                     # ---------------------------------
 
                     market_symbol = next(
