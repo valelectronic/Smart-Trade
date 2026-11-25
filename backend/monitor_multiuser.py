@@ -1,4 +1,4 @@
-"""Lean price monitor for the Rebate Hunter."""
+"""Shared public price monitor for all active Rebate Hunter accounts."""
 
 import asyncio
 import json
@@ -11,7 +11,7 @@ import websockets
 from dotenv import load_dotenv
 
 from cantex_api import discover_market
-from postgres_database import get_active_hunter_rules
+from postgres_database import list_active_users, get_user_active_hunter_rules
 from helpers import dec, now_iso
 
 import config
@@ -35,7 +35,7 @@ INITIAL_RECONNECT_SECONDS = 2
 MAX_RECONNECT_SECONDS = 30
 PRINT_COOLDOWN_SECONDS = 5
 
-# Local signal written by api.py after successful Hunter rule changes
+# Shared local signal written by api.py after any successful Hunter rule change
 RULE_CHANGE_FILE = ROOT / "hunter_rules_changed.flag"
 
 PRICES_FILE = ROOT / "prices.json"
@@ -100,9 +100,18 @@ async def discover_hunter_channels():
     market_channels = {}
 
     try:
-        rules = await asyncio.to_thread(get_active_hunter_rules)
+        # One shared monitor serves every active account. Collect the union
+        # of their active rules, then deduplicate markets before subscribing.
+        users = await asyncio.to_thread(list_active_users)
+        rules = []
 
-        # A successful database query with no active rules is valid.
+        for user in users:
+            user_rules = await asyncio.to_thread(
+                get_user_active_hunter_rules, user["id"]
+            )
+            rules.extend(user_rules)
+
+        # A successful query with no active users/rules is valid.
         if not rules:
             return {}
 
@@ -168,6 +177,7 @@ def get_rule_change_stamp():
 
 
 async def run_monitor():
+    print("[MONITOR] Entering shared market monitor loop.")
     rate_channel = f"market.{RATE_MARKET_SYMBOL}.ticker"
     btc_channel = f"market.{BTC_MARKET_SYMBOL}.ticker"
 

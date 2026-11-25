@@ -13,6 +13,9 @@
 # testing
 /coverage
 
+# Generated Hunter runtime status
+backend/hunter_status_*.json
+
 # next.js
 /.next/
 /out/

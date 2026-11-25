@@ -22,3 +22,5 @@ frontend/build/
 # ==========================================
 .DS_Store
 Thumbs.db
+# Generated Hunter runtime status
+backend/hunter_status_*.json

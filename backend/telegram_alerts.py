@@ -1,183 +1,80 @@
-"""Telegram notifications and non-executing button acknowledgements."""
+"""Notification-only Telegram alerts for the Cantex multi-user Hunter.
+
+Only the two approved alerts are exposed. There are no buttons, polling,
+callbacks, or Telegram-triggered trading controls.
+"""
+from __future__ import annotations
 
 import asyncio
-import time
+import os
 
 import requests
 
+from postgres_database import get_user_by_id
 
-class TelegramAlerts:
-    def __init__(self, bot_token, chat_id):
-        self.bot_token = bot_token
-        self.chat_id = str(chat_id)
 
-        self.base_url = (
-            f"https://api.telegram.org/bot{bot_token}"
-        )
+def _send_message(text: str) -> bool:
+    token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+    chat_id = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+    if not token or not chat_id:
+        return False
 
-        self.offset = None
-        self.last_warning_at = 0.0
+    response = requests.post(
+        f"https://api.telegram.org/bot{token}/sendMessage",
+        json={"chat_id": chat_id, "text": text, "disable_web_page_preview": True},
+        timeout=15,
+    )
+    response.raise_for_status()
+    payload = response.json()
+    if not payload.get("ok"):
+        raise RuntimeError("Telegram rejected the notification")
+    return True
 
-    def _request(self, method, payload=None, timeout=15):
-        response = requests.post(
-            f"{self.base_url}/{method}",
-            json=payload or {},
-            timeout=timeout,
-        )
 
-        response.raise_for_status()
+async def _user_label(user_id: str) -> str:
+    """Resolve the registered username; retain the ID as an unambiguous reference."""
+    clean_user_id = str(user_id)
+    try:
+        user = await asyncio.to_thread(get_user_by_id, clean_user_id)
+        username = str(user.get("username") or "").strip() if user else ""
+        if username:
+            return f"{username} (ID: {clean_user_id})"
+    except Exception as exc:
+        # A username lookup failure must not suppress an important alert.
+        print(f"[TELEGRAM WARNING] Username lookup failed ({type(exc).__name__}).")
+    return f"Unknown username (ID: {clean_user_id})"
 
-        result = response.json()
 
-        if not result.get("ok"):
-            raise RuntimeError(
-                f"Telegram API error: {result}"
-            )
+async def _safe_send(text: str) -> bool:
+    try:
+        sent = await asyncio.to_thread(_send_message, text)
+        if not sent:
+            print("[TELEGRAM WARNING] Notification not sent (bot token or chat ID is missing).")
+        return sent
+    except Exception as exc:
+        # Never print the request URL because it contains the bot token.
+        print(f"[TELEGRAM WARNING] Notification could not be sent ({type(exc).__name__}).")
+        return False
 
-        return result.get("result")
 
-    async def send_trade_ready(self, message, callback_id):
-        """Send a trade-ready alert with non-executing buttons."""
-        payload = {
-            "chat_id": self.chat_id,
-            "text": message,
-            "reply_markup": {
-                "inline_keyboard": [[
-                    {
-                        "text": "✅ EXECUTE",
-                        "callback_data": f"execute:{callback_id}",
-                    },
-                    {
-                        "text": "❌ SKIP",
-                        "callback_data": f"skip:{callback_id}",
-                    },
-                ]]
-            },
-            "disable_web_page_preview": True,
-        }
+async def send_daily_allowance_exhausted(user_id: str, daily_limit: int = 25) -> bool:
+    user = await _user_label(user_id)
+    return await _safe_send(
+        "DAILY TARGET COMPLETED\n"
+        f"User: {user}\n"
+        f"Completed {daily_limit}/{daily_limit} successful swaps today.\n"
+        "The Hunter has finished this account's daily target. No further swaps will be attempted until the daily reset."
+    )
 
-        return await asyncio.to_thread(
-            self._request,
-            "sendMessage",
-            payload,
-            15,
-        )
 
-    async def _handle_update(self, update):
-        callback = update.get("callback_query")
-
-        if not callback:
-            return
-
-        callback_id = callback.get("id")
-        data = callback.get("data", "")
-
-        message = callback.get("message") or {}
-
-        callback_chat = (
-            message.get("chat") or {}
-        ).get("id")
-
-        if data.startswith("execute:"):
-            reply = (
-                "Execution logic pending — "
-                "no swap executed."
-            )
-
-        elif data.startswith("skip:"):
-            reply = "Skipped — no swap executed."
-
-        else:
-            reply = (
-                "Unknown button action. "
-                "No swap executed."
-            )
-
-        try:
-            await asyncio.to_thread(
-                self._request,
-                "answerCallbackQuery",
-                {
-                    "callback_query_id": callback_id,
-                    "text": reply,
-                    "show_alert": True,
-                },
-                15,
-            )
-
-        except Exception as exc:
-            print(
-                "[TELEGRAM WARNING] Could not acknowledge "
-                f"button click: {exc}"
-            )
-
-        target_chat = (
-            callback_chat
-            if callback_chat is not None
-            else self.chat_id
-        )
-
-        try:
-            await asyncio.to_thread(
-                self._request,
-                "sendMessage",
-                {
-                    "chat_id": target_chat,
-                    "text": reply,
-                },
-                15,
-            )
-
-        except Exception as exc:
-            print(
-                "[TELEGRAM WARNING] Could not send "
-                f"button response: {exc}"
-            )
-
-    async def poll(self):
-        """Poll Telegram for button clicks without trading actions."""
-        print(
-            "[TELEGRAM] Button polling started. "
-            "EXECUTE only acknowledges pending logic."
-        )
-
-        while True:
-            try:
-                params = {
-                    "timeout": 20,
-                    "allowed_updates": ["callback_query"],
-                }
-
-                if self.offset is not None:
-                    params["offset"] = self.offset
-
-                result = await asyncio.to_thread(
-                    self._request,
-                    "getUpdates",
-                    params,
-                    30,
-                )
-
-                for update in result or []:
-                    self.offset = max(
-                        self.offset or 0,
-                        update.get("update_id", 0) + 1,
-                    )
-
-                    await self._handle_update(update)
-
-            except asyncio.CancelledError:
-                raise
-
-            except Exception as exc:
-                now = time.monotonic()
-
-                if now - self.last_warning_at >= 30:
-                    print(
-                        "[TELEGRAM WARNING] Polling failed; "
-                        f"retrying: {exc}"
-                    )
-
-                    self.last_warning_at = now
-
-                await asyncio.sleep(3)
+async def send_transaction_needs_review(
+    user_id: str, tx_id: str | None = None, reason: str | None = None
+) -> bool:
+    user = await _user_label(user_id)
+    details = ["MANUAL ATTENTION REQUIRED", f"User: {user}"]
+    if tx_id:
+        details.append(f"Transaction: {tx_id}")
+    if reason:
+        details.append(f"Reason: {reason[:500]}")
+    details.append("The Hunter has stopped this account and requires owner review in the application/database.")
+    return await _safe_send("\n".join(details))
