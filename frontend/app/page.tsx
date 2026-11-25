@@ -16,7 +16,7 @@ import {
   X,
 } from "lucide-react";
 
-const API_BASE = "https://smart-trade-production-44e4.up.railway.app";
+const API_BASE = "/api/backend";
 
 type MarketPrices = {
   cc_usd?: number | string | null;

@@ -15,7 +15,7 @@ from typing import Any
 import psycopg2
 from psycopg2.extras import RealDictCursor
 
-DAILY_SWAP_LIMIT = 25
+MAX_DAILY_SWAP_LIMIT = 100
 
 
 def get_connection():
@@ -35,7 +35,8 @@ def init_db():
         },
         "hunter_control": {
             "user_id", "manual_lock", "lock_reason", "lock_tx_id", "locked_at",
-            "resolution_note", "resolved_at", "daily_date", "swaps_remaining", "updated_at",
+            "resolution_note", "resolved_at", "daily_date", "daily_swap_limit",
+            "swaps_remaining", "updated_at",
         },
         "hunter_rules": {
             "id", "user_id", "token_a", "token_b", "net_min", "net_max",
@@ -103,6 +104,22 @@ def init_db():
             # hunter_control is keyed only by user_id; the legacy singleton id must be gone.
             if "id" in actual_columns.get("hunter_control", set()):
                 problems.append("hunter_control: obsolete id column must be dropped")
+
+            cursor.execute(
+                """
+                SELECT 1
+                FROM pg_constraint
+                WHERE conrelid = 'public.hunter_control'::regclass
+                  AND contype = 'c'
+                  AND conname = 'hunter_control_daily_swap_limit_check'
+                LIMIT 1
+                """
+            )
+            if cursor.fetchone() is None:
+                problems.append(
+                    "hunter_control must have CHECK constraint "
+                    "hunter_control_daily_swap_limit_check (0 <= daily_swap_limit <= 100)"
+                )
 
             expected_constraints = (
                 ("hunter_control", "p", "PRIMARY KEY (user_id)",
@@ -276,11 +293,64 @@ def _require_user_id(user_id):
     return value
 
 def _ensure_user_control_row(cursor, user_id):
-    """Create/lock user state; requires cutover to drop legacy hunter_control.id."""
+    """Create/lock user state; requires the per-user daily_swap_limit column."""
     user_id = _require_user_id(user_id)
-    cursor.execute("\n        INSERT INTO hunter_control (\n            user_id, manual_lock, lock_reason, lock_tx_id, locked_at,\n            resolution_note, resolved_at, daily_date, swaps_remaining, updated_at\n        )\n        SELECT\n            %s, FALSE, NULL, NULL, NULL, NULL, NULL,\n            (NOW() AT TIME ZONE 'UTC')::date,\n            GREATEST(\n                0,\n                %s - (\n                    SELECT COUNT(*)::integer\n                    FROM rebate_swaps\n                    WHERE user_id = %s\n                      AND created_at >=\n                          (date_trunc('day', NOW() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC')\n                      AND created_at <\n                          ((date_trunc('day', NOW() AT TIME ZONE 'UTC') + INTERVAL '1 day')\n                           AT TIME ZONE 'UTC')\n                )\n            ),\n            NOW()\n        ON CONFLICT (user_id) DO NOTHING\n        ", (user_id, DAILY_SWAP_LIMIT, user_id))
-    cursor.execute("\n        UPDATE hunter_control\n        SET daily_date = (NOW() AT TIME ZONE 'UTC')::date,\n            swaps_remaining = GREATEST(\n                0,\n                %s - (\n                    SELECT COUNT(*)::integer\n                    FROM rebate_swaps\n                    WHERE user_id = %s\n                      AND created_at >=\n                          (date_trunc('day', NOW() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC')\n                      AND created_at <\n                          ((date_trunc('day', NOW() AT TIME ZONE 'UTC') + INTERVAL '1 day')\n                           AT TIME ZONE 'UTC')\n                )\n            ),\n            updated_at = NOW()\n        WHERE user_id = %s\n          AND daily_date <> (NOW() AT TIME ZONE 'UTC')::date\n        ", (DAILY_SWAP_LIMIT, user_id, user_id))
-    cursor.execute('SELECT * FROM hunter_control WHERE user_id = %s FOR UPDATE', (user_id,))
+    cursor.execute(
+        """
+        INSERT INTO hunter_control (
+            user_id, manual_lock, lock_reason, lock_tx_id, locked_at,
+            resolution_note, resolved_at, daily_date, daily_swap_limit,
+            swaps_remaining, updated_at
+        )
+        SELECT
+            %s, FALSE, NULL, NULL, NULL, NULL, NULL,
+            (NOW() AT TIME ZONE 'UTC')::date,
+            25,
+            GREATEST(
+                0,
+                25 - (
+                    SELECT COUNT(*)::integer
+                    FROM rebate_swaps
+                    WHERE user_id = %s
+                      AND created_at >=
+                          (date_trunc('day', NOW() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC')
+                      AND created_at <
+                          ((date_trunc('day', NOW() AT TIME ZONE 'UTC') + INTERVAL '1 day')
+                           AT TIME ZONE 'UTC')
+                )
+            ),
+            NOW()
+        ON CONFLICT (user_id) DO NOTHING
+        """,
+        (user_id, user_id),
+    )
+    cursor.execute(
+        """
+        UPDATE hunter_control
+        SET daily_date = (NOW() AT TIME ZONE 'UTC')::date,
+            swaps_remaining = GREATEST(
+                0,
+                daily_swap_limit - (
+                    SELECT COUNT(*)::integer
+                    FROM rebate_swaps
+                    WHERE user_id = %s
+                      AND created_at >=
+                          (date_trunc('day', NOW() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC')
+                      AND created_at <
+                          ((date_trunc('day', NOW() AT TIME ZONE 'UTC') + INTERVAL '1 day')
+                           AT TIME ZONE 'UTC')
+                )
+            ),
+            updated_at = NOW()
+        WHERE user_id = %s
+          AND daily_date <> (NOW() AT TIME ZONE 'UTC')::date
+        """,
+        (user_id, user_id),
+    )
+    cursor.execute(
+        'SELECT * FROM hunter_control WHERE user_id = %s FOR UPDATE',
+        (user_id,),
+    )
     row = cursor.fetchone()
     if row is None:
         raise RuntimeError('Could not initialise user Hunter control state')
@@ -292,33 +362,6 @@ def get_user_hunter_control_state(user_id):
     try:
         with connection.cursor() as cursor:
             row = _ensure_user_control_row(cursor, user_id)
-        connection.commit()
-        return {'manual_intervention_required': bool(row['manual_lock']), 'lock_reason': row['lock_reason'], 'lock_tx_id': row['lock_tx_id'], 'locked_at': row['locked_at'].isoformat() if row['locked_at'] else None, 'daily_date': row['daily_date'].isoformat(), 'swaps_remaining': int(row['swaps_remaining']), 'daily_limit': DAILY_SWAP_LIMIT, 'updated_at': row['updated_at'].isoformat() if row['updated_at'] else None}
-    except Exception:
-        connection.rollback()
-        raise
-    finally:
-        connection.close()
-
-def apply_user_manual_swap_count(user_id, manual_swaps_today: int):
-    """Apply a user's manual swaps without allowing the daily allowance to rise.
-
-    Remaining = daily limit - manual swaps reported - successful Hunter swaps
-    recorded for this user today. The current allowance is only reduced, never
-    increased, until the existing UTC-day rollover (01:00 Nigeria time).
-    """
-    user_id = _require_user_id(user_id)
-    if isinstance(manual_swaps_today, bool) or not isinstance(manual_swaps_today, int):
-        raise ValueError('manual_swaps_today must be an integer')
-    if not 0 <= manual_swaps_today <= DAILY_SWAP_LIMIT:
-        raise ValueError(
-            f'manual_swaps_today must be between 0 and {DAILY_SWAP_LIMIT}'
-        )
-
-    connection = get_connection()
-    try:
-        with connection.cursor() as cursor:
-            control_row = _ensure_user_control_row(cursor, user_id)
             cursor.execute(
                 """
                 SELECT COUNT(*) AS count
@@ -333,38 +376,18 @@ def apply_user_manual_swap_count(user_id, manual_swaps_today: int):
                 (user_id,),
             )
             count_row = cursor.fetchone()
-            automated_swaps_today = int(count_row['count']) if count_row else 0
-
-            calculated_remaining = max(
-                0,
-                DAILY_SWAP_LIMIT - manual_swaps_today - automated_swaps_today,
-            )
-            # The user-facing endpoint can reduce, but never replenish, today's
-            # allowance. Swap logging uses the same row lock before decrementing.
-            new_remaining = min(
-                int(control_row['swaps_remaining']),
-                calculated_remaining,
-            )
-            cursor.execute(
-                """
-                UPDATE hunter_control
-                SET swaps_remaining = %s, updated_at = NOW()
-                WHERE user_id = %s
-                RETURNING daily_date, swaps_remaining, manual_lock
-                """,
-                (new_remaining, user_id),
-            )
-            row = cursor.fetchone()
-
         connection.commit()
         return {
-            'daily_date': row['daily_date'].isoformat(),
-            'manual_swaps_today': manual_swaps_today,
-            'automated_swaps_today': automated_swaps_today,
-            'swaps_completed_today': manual_swaps_today + automated_swaps_today,
-            'swaps_remaining': int(row['swaps_remaining']),
-            'daily_limit': DAILY_SWAP_LIMIT,
             'manual_intervention_required': bool(row['manual_lock']),
+            'lock_reason': row['lock_reason'],
+            'lock_tx_id': row['lock_tx_id'],
+            'locked_at': row['locked_at'].isoformat() if row['locked_at'] else None,
+            'daily_date': row['daily_date'].isoformat(),
+            'daily_swap_limit': int(row['daily_swap_limit']),
+            'daily_limit': int(row['daily_swap_limit']),
+            'swaps_completed': int(count_row['count']) if count_row else 0,
+            'swaps_remaining': int(row['swaps_remaining']),
+            'updated_at': row['updated_at'].isoformat() if row['updated_at'] else None,
         }
     except Exception:
         connection.rollback()
@@ -372,6 +395,63 @@ def apply_user_manual_swap_count(user_id, manual_swaps_today: int):
     finally:
         connection.close()
 
+
+def set_user_daily_swap_limit(user_id, new_limit: int):
+    """Set a user's daily Hunter target; manual external swaps are not counted."""
+    user_id = _require_user_id(user_id)
+    if isinstance(new_limit, bool) or not isinstance(new_limit, int):
+        raise ValueError('daily_swap_limit must be an integer')
+    if not 0 <= new_limit <= MAX_DAILY_SWAP_LIMIT:
+        raise ValueError(
+            f'daily_swap_limit must be between 0 and {MAX_DAILY_SWAP_LIMIT}'
+        )
+
+    connection = get_connection()
+    try:
+        with connection.cursor() as cursor:
+            _ensure_user_control_row(cursor, user_id)
+            cursor.execute(
+                """
+                SELECT COUNT(*) AS count
+                FROM rebate_swaps
+                WHERE user_id = %s
+                  AND created_at >=
+                      (date_trunc('day', NOW() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC')
+                  AND created_at <
+                      ((date_trunc('day', NOW() AT TIME ZONE 'UTC') + INTERVAL '1 day')
+                       AT TIME ZONE 'UTC')
+                """,
+                (user_id,),
+            )
+            count_row = cursor.fetchone()
+            completed = int(count_row['count']) if count_row else 0
+            cursor.execute(
+                """
+                UPDATE hunter_control
+                SET daily_swap_limit = %s,
+                    swaps_remaining = GREATEST(0, %s - %s),
+                    updated_at = NOW()
+                WHERE user_id = %s
+                RETURNING daily_date, daily_swap_limit, swaps_remaining, manual_lock
+                """,
+                (new_limit, new_limit, completed, user_id),
+            )
+            row = cursor.fetchone()
+
+        connection.commit()
+        return {
+            'daily_date': row['daily_date'].isoformat(),
+            'daily_swap_limit': int(row['daily_swap_limit']),
+            'daily_limit': int(row['daily_swap_limit']),
+            'swaps_completed': completed,
+            'swaps_remaining': int(row['swaps_remaining']),
+            'manual_intervention_required': bool(row['manual_lock']),
+        }
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
 
 def activate_user_manual_intervention_lock(user_id, reason: str, tx_id: str | None=None):
     user_id = _require_user_id(user_id)

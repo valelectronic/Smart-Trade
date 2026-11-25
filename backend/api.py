@@ -33,7 +33,7 @@ from postgres_database import (
     get_user_auth_record,
     get_user_by_id,
     get_user_hunter_control_state,
-    apply_user_manual_swap_count,
+    set_user_daily_swap_limit,
     clear_user_manual_intervention_lock,
     get_user_hunter_rules,
     create_user_hunter_rule,
@@ -54,7 +54,8 @@ from portfolio_cache import get as get_cached_portfolio, set as set_cached_portf
 
 TOKEN_TTL_SECONDS = 60 * 60 * 24
 MAX_RULES_PER_USER = 2
-DAILY_SWAP_LIMIT = 25
+DEFAULT_DAILY_SWAP_LIMIT = 25
+MAX_DAILY_SWAP_LIMIT = 100
 TOKEN_CACHE_SECONDS = 600
 AUTH_SECRET = os.getenv("APP_AUTH_SECRET", "")
 _password_hasher = PasswordHasher()
@@ -200,9 +201,8 @@ class HunterRuleCreate(BaseModel):
     net_max: str
 
 
-class ManualSwapCountRequest(BaseModel):
-    # Successful swaps completed manually in Cantex during the current UTC day.
-    manual_swaps_today: int = Field(ge=0, le=DAILY_SWAP_LIMIT)
+class DailySwapLimitRequest(BaseModel):
+    daily_swap_limit: int = Field(ge=0, le=MAX_DAILY_SWAP_LIMIT)
 
 
 class ManualInterventionClearRequest(BaseModel):
@@ -288,16 +288,18 @@ def get_hunter_control(user=Depends(current_user)):
         raise HTTPException(status_code=500, detail=f"Could not read Hunter control state: {exc}")
 
 
-@app.put("/api/hunter-allowance")
-def update_daily_allowance(req: ManualSwapCountRequest, user=Depends(current_user)):
-    """Apply manually completed swaps to this user's remaining daily allowance."""
+@app.put("/api/hunter-daily-limit")
+def update_daily_swap_limit(
+    req: DailySwapLimitRequest, user=Depends(current_user)
+):
+    """Set this user's daily Hunter target; external manual swaps are ignored."""
     try:
-        state = apply_user_manual_swap_count(
-            user["id"], req.manual_swaps_today
+        state = set_user_daily_swap_limit(
+            user["id"], req.daily_swap_limit
         )
         return {
             "status": "success",
-            "message": "Manual swaps recorded; Hunter allowance recalculated.",
+            "message": "Daily Hunter target updated.",
             **state,
         }
     except ValueError as exc:
@@ -305,7 +307,7 @@ def update_daily_allowance(req: ManualSwapCountRequest, user=Depends(current_use
     except Exception:
         raise HTTPException(
             status_code=500,
-            detail="Could not update the daily Hunter allowance.",
+            detail="Could not update the daily Hunter target.",
         )
 
 
@@ -829,8 +831,16 @@ def get_hunter_status(user=Depends(current_user)):
         if not control_state:
             raise RuntimeError("Hunter control state is unavailable")
 
-        remaining = int(control_state.get("swaps_remaining", DAILY_SWAP_LIMIT))
-        remaining = max(0, min(DAILY_SWAP_LIMIT, remaining))
+        daily_limit = int(
+            control_state.get(
+                "daily_swap_limit",
+                control_state.get("daily_limit", DEFAULT_DAILY_SWAP_LIMIT),
+            )
+        )
+        remaining = max(
+            0,
+            min(daily_limit, int(control_state.get("swaps_remaining", daily_limit))),
+        )
         manual_intervention_required = bool(
             control_state.get("manual_intervention_required", False)
         )
@@ -872,11 +882,13 @@ def get_hunter_status(user=Depends(current_user)):
                     f"{safe_user_id[:8]}: {exc}"
                 )
 
-        swaps_done = DAILY_SWAP_LIMIT - remaining
+        swaps_done = int(
+            control_state.get("swaps_completed", daily_limit - remaining)
+        )
         if runtime is not None:
             swaps_done = max(
                 swaps_done,
-                min(DAILY_SWAP_LIMIT, int(getattr(runtime, "swaps_done", 0))),
+                int(getattr(runtime, "swaps_done", 0)),
             )
 
         return {
@@ -886,7 +898,8 @@ def get_hunter_status(user=Depends(current_user)):
             "is_waiting": hunter_state == "waiting",
             "swaps_done": swaps_done,
             "swaps_remaining": remaining,
-            "daily_limit": DAILY_SWAP_LIMIT,
+            "daily_limit": daily_limit,
+            "daily_swap_limit": daily_limit,
             "manual_intervention_required": manual_intervention_required,
             "pending_pairs": (
                 len(getattr(runtime, "pending_pairs", set()))
@@ -932,7 +945,9 @@ async def request_hunter_slot(user=Depends(current_user)):
         control_state = await asyncio.to_thread(
             get_user_hunter_control_state, user_id
         )
-        remaining = int(control_state.get("swaps_remaining", DAILY_SWAP_LIMIT))
+        remaining = int(
+            control_state.get("swaps_remaining", DEFAULT_DAILY_SWAP_LIMIT)
+        )
 
         if remaining <= 0:
             # Keep the in-memory marker aligned with the database allowance.

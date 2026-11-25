@@ -127,7 +127,7 @@ MIN_SWAP_SIZE_CC = Decimal("100.0")
 MAX_SWAP_SIZE_CC = Decimal("102.0")
 POOL_MIN = Decimal("0.10")
 POOL_MAX = Decimal("0.17")
-DAILY_LIMIT = 25
+DEFAULT_DAILY_LIMIT = 25
 POST_SWAP_COOLDOWN = 20
 RED_LIGHT_WAIT = 10      
 MIN_CC_BALANCE = Decimal("5.0") 
@@ -141,8 +141,11 @@ def _allowance_remaining(user_id):
     state = get_user_hunter_control_state(user_id)
     if not state:
         raise RuntimeError("Hunter control state is unavailable")
-    remaining = int(state.get("swaps_remaining", DAILY_LIMIT))
-    return max(0, min(DAILY_LIMIT, remaining)), state
+    daily_limit = int(
+        state.get("daily_swap_limit", state.get("daily_limit", DEFAULT_DAILY_LIMIT))
+    )
+    remaining = int(state.get("swaps_remaining", daily_limit))
+    return max(0, min(daily_limit, remaining)), state
 
 
 async def _activate_manual_lock(runtime: UserRuntime, reason: str, tx_id=None):
@@ -175,7 +178,15 @@ async def _notify_daily_allowance_exhausted(runtime: UserRuntime):
     if runtime.daily_allowance_alerted:
         return
     runtime.daily_allowance_alerted = True
-    await send_daily_allowance_exhausted(runtime.user_id, DAILY_LIMIT)
+    try:
+        _, state = _allowance_remaining(runtime.user_id)
+        daily_limit = int(
+            state.get("daily_swap_limit", state.get("daily_limit", DEFAULT_DAILY_LIMIT))
+        )
+    except Exception as exc:
+        print(f"[ALLOWANCE NOTIFICATION WARNING] Could not read current daily target: {exc}")
+        daily_limit = DEFAULT_DAILY_LIMIT
+    await send_daily_allowance_exhausted(runtime.user_id, daily_limit)
 
 
 def extract_quote_fees(quote):
@@ -470,7 +481,7 @@ async def check_and_swap(runtime: UserRuntime, client, instruments, sell_token, 
                 if logged:
                     runtime.swaps_done += 1
                     invalidate_portfolio_cache(runtime.user_id)
-                    print(f" Confirmed swap recorded. Session count: {runtime.swaps_done}/{DAILY_LIMIT}")
+                    print(f" Confirmed swap recorded. Session successful swaps: {runtime.swaps_done}")
                 else:
                     print(f" Transaction {tx_id} already exists in DB; duplicate count prevented.")
 
@@ -545,8 +556,16 @@ async def run_user(runtime: UserRuntime):
         print("[MANUAL INTERVENTION LOCK] Persistent lock active. Owner review is required.")
         return "HALTED_MANUAL_INTERVENTION"
 
-    runtime.swaps_done = DAILY_LIMIT - remaining
-    print(f" Today's effective allowance: {remaining} remaining ({runtime.swaps_done}/{DAILY_LIMIT} used).")
+    daily_limit = int(
+        control_state.get("daily_swap_limit", control_state.get("daily_limit", DEFAULT_DAILY_LIMIT))
+    )
+    runtime.swaps_done = int(
+        control_state.get("swaps_completed", daily_limit - remaining)
+    )
+    print(
+        f" Today's effective allowance: {remaining} remaining "
+        f"({runtime.swaps_done}/{daily_limit} used)."
+    )
 
     if remaining <= 0:
         now = datetime.now(timezone.utc)
@@ -587,7 +606,15 @@ async def run_user(runtime: UserRuntime):
                     runtime.swap_halted = True
                     print("[MANUAL INTERVENTION LOCK] Persistent lock activated. Stopping Hunter.")
                     break
-                runtime.swaps_done = DAILY_LIMIT - remaining
+                daily_limit = int(
+                    control_state.get(
+                        "daily_swap_limit",
+                        control_state.get("daily_limit", DEFAULT_DAILY_LIMIT),
+                    )
+                )
+                runtime.swaps_done = int(
+                    control_state.get("swaps_completed", daily_limit - remaining)
+                )
                 if remaining <= 0:
                     break
             except Exception as control_err:
