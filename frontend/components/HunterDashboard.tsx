@@ -48,6 +48,7 @@ export function HunterDashboard() {
   const [deletingId, setDeletingId] = useState<number | null>(null);
   const [isSavingAllowance, setIsSavingAllowance] = useState(false);
   const [isClearingLock, setIsClearingLock] = useState(false);
+  const [isClearLockDialogOpen, setIsClearLockDialogOpen] = useState(false);
   const [allowanceInput, setAllowanceInput] = useState(String(DEFAULT_DAILY_LIMIT));
   const allowanceDirtyRef = useRef(false);
   const [resolutionNote, setResolutionNote] = useState("");
@@ -215,8 +216,17 @@ export function HunterDashboard() {
       toast.error("Add a review note of at least 10 characters.");
       return;
     }
-    if (!window.confirm("Confirm that you have reviewed the incident and want to allow the Hunter to resume?")) return;
+    setIsClearLockDialogOpen(true);
+  };
 
+  const confirmClearManualLock = async () => {
+    const note = resolutionNote.trim();
+    if (note.length < 10) {
+      setIsClearLockDialogOpen(false);
+      toast.error("Add a review note of at least 10 characters.");
+      return;
+    }
+    setIsClearLockDialogOpen(false);
     setIsClearingLock(true);
     try {
       const res = await fetch(`${apiUrl}/api/manual-intervention/clear`, {
@@ -430,6 +440,24 @@ export function HunterDashboard() {
             ))}
           </div>
         </Card>
+      )}
+
+      {isClearLockDialogOpen && (
+        <div className="fixed inset-0 z-[100] flex items-center justify-center bg-black/70 p-4" onMouseDown={(event) => { if (event.target === event.currentTarget) setIsClearLockDialogOpen(false); }}>
+          <div role="alertdialog" aria-modal="true" aria-labelledby="clear-lock-title" aria-describedby="clear-lock-description" className="w-full max-w-md rounded-2xl border border-red-500/40 bg-carbon p-5 shadow-2xl">
+            <div className="flex items-start gap-3">
+              <AlertTriangle size={22} className="mt-0.5 shrink-0 text-red-400" />
+              <div>
+                <h2 id="clear-lock-title" className="text-base font-semibold text-snow">Allow the Hunter to resume?</h2>
+                <p id="clear-lock-description" className="mt-2 text-sm leading-relaxed text-granite">Confirm that you have reviewed the incident and account state. Clearing this manual intervention allows the Hunter to resume.</p>
+              </div>
+            </div>
+            <div className="mt-5 flex justify-end gap-2">
+              <Button variant="outline" onClick={() => setIsClearLockDialogOpen(false)} className="rounded-xl px-4">Cancel</Button>
+              <Button onClick={confirmClearManualLock} disabled={isClearingLock} className="rounded-xl bg-red-600 px-4 text-white hover:bg-red-700">Confirm & Resume</Button>
+            </div>
+          </div>
+        </div>
       )}
     </div>
   );
