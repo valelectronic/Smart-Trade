@@ -56,6 +56,10 @@ export function HunterDashboard() {
   const [availableTokens, setAvailableTokens] = useState<string[]>([]);
   const [walletBalances, setWalletBalances] = useState<Record<string, string>>({});
   const [portfolio, setPortfolio] = useState<any>(null);
+  const [slotStatus, setSlotStatus] = useState<any>(null);
+  const [isRequestingSlot, setIsRequestingSlot] = useState(false);
+  const [isReleasingSlot, setIsReleasingSlot] = useState(false);
+  const [isReleaseDialogOpen, setIsReleaseDialogOpen] = useState(false);
 
   const [isSaving, setIsSaving] = useState(false);
   const [deletingId, setDeletingId] = useState<number | null>(null);
@@ -111,24 +115,22 @@ export function HunterDashboard() {
   useEffect(() => {
     const fetchBalances = async () => {
       try {
-        // This endpoint supplies the USD valuation fields used by the portfolio card.
         const res = await fetch(`${apiUrl}/api/portfolio-value`, { cache: "no-store" });
         if (!res.ok) return;
-
         const data = await res.json();
 
-        // Keep the last good snapshot if the response has an unexpected shape.
-        if (!data || !Array.isArray(data.tokens)) return;
-
-        setPortfolio(data);
-
-        const upper: Record<string, string> = {};
-        data.tokens.forEach((token: any) => {
-          if (token?.symbol) {
-            upper[String(token.symbol).toUpperCase()] = String(token.available ?? "0");
-          }
-        });
-        setWalletBalances(upper);
+        if (Array.isArray(data?.tokens)) {
+          setPortfolio(data);
+          const upper: Record<string, string> = {};
+          data.tokens.forEach((token: any) => {
+            if (token?.symbol) upper[String(token.symbol).toUpperCase()] = String(token.available ?? "0");
+          });
+          setWalletBalances(upper);
+        } else {
+          const upper: Record<string, string> = {};
+          Object.keys(data || {}).forEach(k => upper[k.toUpperCase()] = String(data[k]));
+          setWalletBalances(upper);
+        }
       } catch (err) {
         // Retain the last successful balance and portfolio snapshot.
       }
@@ -148,13 +150,69 @@ export function HunterDashboard() {
     return () => document.removeEventListener("mousedown", handleClickOutside);
   }, []);
 
+  const fetchStatus = async () => {
+    try {
+      const res = await fetch(`${apiUrl}/api/hunter-status`, { cache: "no-store" });
+      if (res.ok) setStatus(await res.json());
+    } catch (err) {
+      setStatus({ status: "OFFLINE" });
+    }
+  };
+
+  const fetchSlotStatus = async () => {
+    try {
+      const res = await fetch(`${apiUrl}/api/slot/status`, { cache: "no-store" });
+      const data = await res.json().catch(() => ({}));
+      if (res.ok) setSlotStatus(data);
+    } catch {
+      // Retain the last known slot state during temporary API interruptions.
+    }
+  };
+
+  const handleRequestSlot = async () => {
+    if (isRequestingSlot || isReleasingSlot) return;
+    setIsRequestingSlot(true);
+    try {
+      const res = await fetch(`${apiUrl}/api/slot/request`, { method: "POST" });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        toast.error(data.detail || data.message || "Could not request a Hunter slot.");
+        await fetchSlotStatus();
+        return;
+      }
+      toast.success(data.message || "Hunter slot request submitted.");
+      await fetchSlotStatus();
+      await fetchStatus();
+    } catch {
+      toast.error("Could not connect to request a Hunter slot.");
+    } finally {
+      setIsRequestingSlot(false);
+    }
+  };
+
+  const handleReleaseSlot = async () => {
+    if (isRequestingSlot || isReleasingSlot) return;
+    setIsReleaseDialogOpen(false);
+    setIsReleasingSlot(true);
+    try {
+      const res = await fetch(`${apiUrl}/api/slot/release`, { method: "POST" });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        toast.error(data.detail || data.message || "Could not release the Hunter slot.");
+        await fetchSlotStatus();
+        return;
+      }
+      toast.success(data.message || "Hunter slot released.");
+      await fetchSlotStatus();
+      await fetchStatus();
+    } catch {
+      toast.error("Could not connect to release the Hunter slot.");
+    } finally {
+      setIsReleasingSlot(false);
+    }
+  };
+
   useEffect(() => {
-    const fetchStatus = async () => {
-      try {
-        const res = await fetch(`${apiUrl}/api/hunter-status`, { cache: "no-store" });
-        if (res.ok) setStatus(await res.json());
-      } catch (err) { setStatus({ status: "OFFLINE" }); }
-    };
     const fetchRules = async () => {
       try {
         const res = await fetch(`${apiUrl}/api/hunter-rules`, { cache: "no-store" });
@@ -186,6 +244,9 @@ export function HunterDashboard() {
     fetchControl();
     fetchDailyStats();
     fetchHistory();
+    fetchSlotStatus();
+
+    const slotInterval = window.setInterval(() => { void fetchSlotStatus(); }, 15000);
 
     // Keep fast-changing engine status separate from database-backed dashboard data.
     const statusInterval = window.setInterval(() => {
@@ -208,6 +269,7 @@ export function HunterDashboard() {
 
     return () => {
       window.clearInterval(statusInterval);
+      window.clearInterval(slotInterval);
       window.clearInterval(controlInterval);
       window.clearInterval(dailyStatsInterval);
       window.clearInterval(historyInterval);
@@ -397,6 +459,26 @@ export function HunterDashboard() {
 
       {activeSubTab === "status" && (
         <>
+          <Card className="bg-carbon border-jet-black p-4 mb-4">
+            <div className="flex flex-wrap items-center justify-between gap-3">
+              <div className="min-w-0">
+                <h2 className="text-sm font-semibold text-snow">Hunter Slot</h2>
+                <p className="mt-1 text-xs text-granite">Activate your Hunter to start processing saved rules. If all slots are occupied, your account joins the waiting queue.</p>
+                <p className="mt-2 text-xs text-granite">Status: <span className={`font-semibold ${slotStatus?.slot_status === "active" ? "text-emerald" : slotStatus?.slot_status === "waiting" ? "text-amber-300" : slotStatus?.slot_status === "daily_limit_reached" ? "text-red-400" : "text-snow"}`}>{(slotStatus?.slot_status || "checking").replaceAll("_", " ")}</span></p>
+                <p className="mt-1 text-[11px] text-granite">Active slots: {slotStatus?.capacity?.active_count ?? "—"} / {slotStatus?.capacity?.max_slots ?? "—"} · Waiting: {slotStatus?.capacity?.waiting_count ?? "—"}{slotStatus?.is_waiting && slotStatus?.queue_position != null ? ` · Queue position #${slotStatus.queue_position}` : ""}</p>
+              </div>
+              <div className="flex flex-wrap gap-2">
+                <Button onClick={handleRequestSlot} disabled={isRequestingSlot || isReleasingSlot || slotStatus?.is_active || slotStatus?.is_waiting || slotStatus?.daily_limit_reached} className="rounded-xl px-4">
+                  {isRequestingSlot ? "Requesting..." : slotStatus?.is_waiting ? "In queue" : slotStatus?.is_active ? "Slot active" : "Activate Hunter"}
+                </Button>
+                <Button variant="outline" onClick={() => setIsReleaseDialogOpen(true)} disabled={isRequestingSlot || isReleasingSlot || (!slotStatus?.is_active && !slotStatus?.is_waiting)} className="rounded-xl px-4">
+                  {isReleasingSlot ? "Stopping..." : "Stop Hunter"}
+                </Button>
+              </div>
+            </div>
+            {slotStatus?.slot_status === "daily_limit_reached" && <p className="mt-3 text-xs text-red-300">Today's successful-swap allowance has been used. The Hunter can be activated again after the UTC daily reset.</p>}
+          </Card>
+
           {isManualLocked && (
             <Card className="bg-red-950/30 border border-red-500/50 p-4 mb-4">
               <div className="flex items-start gap-3">
@@ -527,6 +609,19 @@ export function HunterDashboard() {
             ))}
           </div>
         </Card>
+      )}
+
+      {isReleaseDialogOpen && (
+        <div className="fixed inset-0 z-[100] flex items-center justify-center bg-black/70 p-4" onMouseDown={(event) => { if (event.target === event.currentTarget) setIsReleaseDialogOpen(false); }}>
+          <div role="alertdialog" aria-modal="true" aria-labelledby="release-slot-title" className="w-full max-w-md rounded-2xl border border-jet-black bg-carbon p-5 shadow-2xl">
+            <h2 id="release-slot-title" className="text-base font-semibold text-snow">Stop the Hunter?</h2>
+            <p className="mt-2 text-sm text-granite">This stops your Hunter and releases its active slot. You can activate it again later.</p>
+            <div className="mt-5 flex justify-end gap-2">
+              <Button variant="outline" onClick={() => setIsReleaseDialogOpen(false)} className="rounded-xl px-4">Cancel</Button>
+              <Button onClick={handleReleaseSlot} disabled={isReleasingSlot} className="rounded-xl bg-red-600 px-4 text-white hover:bg-red-700">Stop Hunter</Button>
+            </div>
+          </div>
+        </div>
       )}
 
       {isClearLockDialogOpen && (
