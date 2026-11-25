@@ -111,22 +111,24 @@ export function HunterDashboard() {
   useEffect(() => {
     const fetchBalances = async () => {
       try {
-        const res = await fetch(`${apiUrl}/api/balances`, { cache: "no-store" });
+        // This endpoint supplies the USD valuation fields used by the portfolio card.
+        const res = await fetch(`${apiUrl}/api/portfolio-value`, { cache: "no-store" });
         if (!res.ok) return;
+
         const data = await res.json();
 
-        if (Array.isArray(data?.tokens)) {
-          setPortfolio(data);
-          const upper: Record<string, string> = {};
-          data.tokens.forEach((token: any) => {
-            if (token?.symbol) upper[String(token.symbol).toUpperCase()] = String(token.available ?? "0");
-          });
-          setWalletBalances(upper);
-        } else {
-          const upper: Record<string, string> = {};
-          Object.keys(data || {}).forEach(k => upper[k.toUpperCase()] = String(data[k]));
-          setWalletBalances(upper);
-        }
+        // Keep the last good snapshot if the response has an unexpected shape.
+        if (!data || !Array.isArray(data.tokens)) return;
+
+        setPortfolio(data);
+
+        const upper: Record<string, string> = {};
+        data.tokens.forEach((token: any) => {
+          if (token?.symbol) {
+            upper[String(token.symbol).toUpperCase()] = String(token.available ?? "0");
+          }
+        });
+        setWalletBalances(upper);
       } catch (err) {
         // Retain the last successful balance and portfolio snapshot.
       }
