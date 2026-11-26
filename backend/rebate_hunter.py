@@ -685,6 +685,8 @@ async def run_user(runtime: UserRuntime):
                 "rules": len(TOKEN_PAIRS), "price_missing": 0, "balance_rejected": 0, "instrument_missing": 0,
                 "stack_guard": 0, "quote_errors": 0, "fee_data_invalid": 0, "network_fee_rejected": 0,
                 "pool_fee_rejected": 0, "qualifying_quotes": 0,
+                "disabled_pairs_cooling_down": 0, "pending_pairs": 0,
+                "disabled_rejections_this_scan": 0,
             }
             rate_limit_hit = False
 
@@ -710,11 +712,18 @@ async def run_user(runtime: UserRuntime):
                 
                 disabled_until = runtime.disabled_pairs.get(pair_key)
                 if disabled_until and time.time() < disabled_until:
+                    scan_stats["disabled_pairs_cooling_down"] += 1
+                    retry_in = max(1, int(disabled_until - time.time()))
+                    print(
+                        f"{_user_tag(runtime)} [PAIR COOLDOWN] {pair_key}: Cantex previously "
+                        f"reported swapping disabled; retry in {retry_in}s. Skipping this pair only."
+                    )
                     continue
                 if disabled_until:
                     runtime.disabled_pairs.pop(pair_key, None)
-                    print(f"[PAIR RETRY] {pair_key}: 360-second disabled-pair cooldown expired.")
+                    print(f"{_user_tag(runtime)} [PAIR RETRY] {pair_key}: 360-second disabled-pair cooldown expired.")
                 if pair_key in runtime.pending_pairs:
+                    scan_stats["pending_pairs"] += 1
                     print(f"{_user_tag(runtime)} [PAIR PENDING] {pair_key}: unresolved submission; skipping this pair only.")
                     continue
                 
@@ -823,9 +832,14 @@ async def run_user(runtime: UserRuntime):
                         )
                     except Exception as e:
                         error_str = str(e).lower()
-                        if "disabled" in error_str or "market is not active" in error_str or "pool is disabled" in error_str:
+                        if "token swapping is currently disabled" in error_str or "market is not active" in error_str or "pool is disabled" in error_str:
                             runtime.disabled_pairs[pair_key] = time.time() + DISABLED_PAIR_COOLDOWN
-                            print(f"[PAIR DISABLED] {pair_key}: explicit disabled response; retrying in 360 seconds.")
+                            scan_stats["disabled_rejections_this_scan"] += 1
+                            print(
+                                f"{_user_tag(runtime)} [PAIR DISABLED] {pair_key}: Cantex rejected "
+                                f"the quote because swapping is disabled; retrying in "
+                                f"{DISABLED_PAIR_COOLDOWN}s. Other pairs remain eligible."
+                            )
                             continue
                         if "429" in error_str or "rate limit" in error_str or "too many requests" in error_str:
                             print(f"{_user_tag(runtime)} RATE LIMIT in scan. Cooling down 30s before the next scan...")
@@ -892,7 +906,26 @@ async def run_user(runtime: UserRuntime):
                     }, runtime)
                     await asyncio.sleep(RED_LIGHT_WAIT)
             else:
-                print(f" No green fees found. Waiting {RED_LIGHT_WAIT}s...")
+                blocked_count = (
+                    scan_stats["disabled_pairs_cooling_down"]
+                    + scan_stats["pending_pairs"]
+                    + scan_stats["disabled_rejections_this_scan"]
+                )
+                if scan_stats["disabled_rejections_this_scan"]:
+                    print(
+                        f"{_user_tag(runtime)} [SCAN RESULT] Cantex disabled swapping for "
+                        f"{scan_stats['disabled_rejections_this_scan']} pair(s) during this scan. "
+                        f"Retry cooldown: {DISABLED_PAIR_COOLDOWN}s. Waiting {RED_LIGHT_WAIT}s before rescanning."
+                    )
+                elif scan_stats["disabled_pairs_cooling_down"] or scan_stats["pending_pairs"]:
+                    print(
+                        f"{_user_tag(runtime)} [SCAN RESULT] No executable opportunity this scan: "
+                        f"{scan_stats['disabled_pairs_cooling_down']} pair(s) in Cantex-disabled cooldown, "
+                        f"{scan_stats['pending_pairs']} pair(s) awaiting transaction review. "
+                        f"Waiting {RED_LIGHT_WAIT}s; other eligible pairs continue to be scanned."
+                    )
+                else:
+                    print(f"{_user_tag(runtime)} No green fees found. Waiting {RED_LIGHT_WAIT}s...")
                 save_status({
                     "time": time.strftime("%H:%M:%S"), "pair": "Scanning...", "net_fee": 0, "pool_fee": 0,
                     "usd_value": 0, "cc_size": 0, "sdk_est_time": 0, "status": " WAITING", "swaps_done": runtime.swaps_done
