@@ -55,10 +55,14 @@ def init_db():
         "swap_execution_events": {
             "id", "user_id", "event_id", "event_type", "payload", "created_at",
         },
+        "hunter_resume_intents": {
+            "user_id", "auto_resume", "exhausted_date", "updated_at",
+        },
     }
     user_owned_tables = (
         "user_credentials", "hunter_control", "hunter_rules",
         "rebate_swaps", "swap_transactions", "swap_execution_events",
+        "hunter_resume_intents",
     )
 
     connection = get_connection()
@@ -130,6 +134,8 @@ def init_db():
                  "rebate_swaps must have UNIQUE (user_id, tx_id)"),
                 ("hunter_rules", "u", "UNIQUE (user_id, token_a, token_b)",
                  "hunter_rules must have UNIQUE (user_id, token_a, token_b)"),
+                ("hunter_resume_intents", "p", "PRIMARY KEY (user_id)",
+                 "hunter_resume_intents must have PRIMARY KEY (user_id)"),
             )
             for table, constraint_type, definition, message in expected_constraints:
                 cursor.execute(
@@ -145,6 +151,22 @@ def init_db():
                 )
                 if cursor.fetchone() is None:
                     problems.append(message)
+
+            cursor.execute(
+                """
+                SELECT 1
+                FROM pg_constraint
+                WHERE conrelid = 'public.hunter_resume_intents'::regclass
+                  AND contype = 'f'
+                  AND pg_get_constraintdef(oid) ILIKE
+                      'FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE'
+                LIMIT 1
+                """
+            )
+            if cursor.fetchone() is None:
+                problems.append(
+                    "hunter_resume_intents must reference users(id) with ON DELETE CASCADE"
+                )
 
             # Verify ownership foreign keys for every user-owned table.
             for table in user_owned_tables:
@@ -389,6 +411,91 @@ def get_user_hunter_control_state(user_id):
             'swaps_remaining': int(row['swaps_remaining']),
             'updated_at': row['updated_at'].isoformat() if row['updated_at'] else None,
         }
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
+
+
+def set_user_hunter_resume_intent(user_id, exhausted_date=None):
+    """Persist that a user wants the Hunter active across daily resets/restarts.
+
+    exhausted_date is NULL while the Hunter is intended to be active (or queued).
+    When the daily target is reached, it is set to that UTC date. The supervisor
+    may resume only after the database's daily_date advances beyond that date.
+    """
+    user_id = _require_user_id(user_id)
+    connection = get_connection()
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                INSERT INTO hunter_resume_intents (
+                    user_id, auto_resume, exhausted_date, updated_at
+                )
+                VALUES (%s, TRUE, %s, NOW())
+                ON CONFLICT (user_id) DO UPDATE
+                SET auto_resume = TRUE,
+                    exhausted_date = EXCLUDED.exhausted_date,
+                    updated_at = NOW()
+                """,
+                (user_id, exhausted_date),
+            )
+        connection.commit()
+        return True
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
+
+
+def get_user_hunter_resume_intents():
+    """Return all persisted auto-resume intents for startup/recovery."""
+    connection = get_connection()
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT user_id, exhausted_date, updated_at
+                FROM hunter_resume_intents
+                WHERE auto_resume = TRUE
+                ORDER BY updated_at ASC, user_id ASC
+                """
+            )
+            rows = cursor.fetchall()
+        return [
+            {
+                "user_id": str(row["user_id"]),
+                "exhausted_date": (
+                    row["exhausted_date"].isoformat()
+                    if row["exhausted_date"] else None
+                ),
+                "updated_at": (
+                    row["updated_at"].isoformat()
+                    if row["updated_at"] else None
+                ),
+            }
+            for row in rows
+        ]
+    finally:
+        connection.close()
+
+
+def clear_user_hunter_resume_intent(user_id):
+    """Remove a user's automatic-resume intent after an explicit stop."""
+    user_id = _require_user_id(user_id)
+    connection = get_connection()
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "DELETE FROM hunter_resume_intents WHERE user_id = %s",
+                (user_id,),
+            )
+            deleted = cursor.rowcount > 0
+        connection.commit()
+        return deleted
     except Exception:
         connection.rollback()
         raise

@@ -148,6 +148,16 @@ def _allowance_remaining(user_id):
     return max(0, min(daily_limit, remaining)), state
 
 
+def _is_explicit_disabled_swap_rejection(error: Exception) -> bool:
+    """Return True only for a deterministic Cantex rejection, not an uncertain submission."""
+    message = str(error).lower()
+    return (
+        "token swapping is currently disabled" in message
+        or "pool is disabled" in message
+        or "market is not active" in message
+    )
+
+
 async def _activate_manual_lock(runtime: UserRuntime, reason: str, tx_id=None):
     runtime.swap_halted = True
     try:
@@ -506,6 +516,22 @@ async def check_and_swap(runtime: UserRuntime, client, instruments, sell_token, 
                 return True
             except Exception as e:
                 pair_id = pair_key or canonical_pair_key(sell_token, buy_token)
+
+                # Cantex's explicit disabled-token/pool response is a deterministic
+                # rejection. It is NOT an uncertain submission and must not create
+                # a pending transaction or trigger manual review. Hold only this
+                # pair for the agreed six-minute retry interval.
+                if _is_explicit_disabled_swap_rejection(e):
+                    runtime.disabled_pairs[pair_id] = time.time() + DISABLED_PAIR_COOLDOWN
+                    print(
+                        f"[PAIR DISABLED] {pair_id}: Cantex explicitly rejected the swap "
+                        f"({e}); retrying this pair in {DISABLED_PAIR_COOLDOWN} seconds. "
+                        "No manual lock; other pairs remain eligible."
+                    )
+                    return "PAIR_COOLDOWN"
+
+                # All other submission/confirmation exceptions remain fail-safe:
+                # the outcome may be uncertain, so block this pair and request review.
                 runtime.pending_pairs.add(pair_id)
                 print(f"[SWAP OUTCOME UNCERTAIN] {e}. Blocking only {pair_id}; other pairs continue.")
                 await _notify_transaction_review(

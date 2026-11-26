@@ -847,11 +847,11 @@ def get_hunter_status(user=Depends(current_user)):
 
         active_slots = getattr(slot_manager, "active", {})
         waiting_users = getattr(slot_manager, "waiting", [])
-        exhausted_users = getattr(slot_manager, "_daily_exhausted", set())
-
         slot = active_slots.get(user_id)
         is_waiting = user_id in waiting_users
-        is_daily_exhausted = remaining <= 0 or user_id in exhausted_users
+        # The database is authoritative for the current UTC-day allowance.
+        # SlotManager's in-memory marker can survive midnight and become stale.
+        is_daily_exhausted = remaining <= 0
 
         runtime = slot.runtime if slot is not None else None
         if manual_intervention_required or (
@@ -1052,10 +1052,31 @@ def get_hunter_slot_status(user=Depends(current_user)):
     manager = _get_slot_manager()
     user_id = str(user["id"])
 
+    # Read the control row first. This applies the database's UTC-day rollover
+    # and prevents yesterday's in-memory exhaustion marker from keeping the
+    # dashboard stuck on daily_limit_reached after the allowance has reset.
+    control_state = get_user_hunter_control_state(user_id)
+    if not control_state:
+        raise HTTPException(
+            status_code=500,
+            detail="Hunter control state is unavailable.",
+        )
+
+    daily_limit = int(
+        control_state.get(
+            "daily_swap_limit",
+            control_state.get("daily_limit", DEFAULT_DAILY_SWAP_LIMIT),
+        )
+    )
+    remaining = max(
+        0,
+        min(daily_limit, int(control_state.get("swaps_remaining", daily_limit))),
+    )
+    exhausted = remaining <= 0
+
     active = user_id in manager.active
     waiting_users = manager.waiting
     waiting = user_id in waiting_users
-    exhausted = user_id in getattr(manager, "_daily_exhausted", set())
 
     if active:
         slot_status = "active"
@@ -1077,6 +1098,8 @@ def get_hunter_slot_status(user=Depends(current_user)):
         "is_waiting": waiting,
         "queue_position": queue_position,
         "daily_limit_reached": exhausted,
+        "daily_swap_limit": daily_limit,
+        "swaps_remaining": remaining,
         "capacity": {
             "max_slots": int(manager.max_slots),
             "active_count": len(manager.active),
