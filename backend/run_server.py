@@ -24,6 +24,7 @@ from api import app
 from monitor_multiuser import run_monitor
 from postgres_database import (
     clear_user_hunter_resume_intent,
+    cleanup_old_execution_events,
     get_user_hunter_control_state,
     get_user_hunter_resume_intents,
     init_db,
@@ -39,7 +40,7 @@ MAX_ACTIVE_HUNTERS = 5
 MONITOR_RETRY_SECONDS = 5
 API_STARTUP_TIMEOUT_SECONDS = 30
 CONTROL_STATE_RETRY_SECONDS = 60
-LOOP_RETRY_SECONDS = 10
+LOOP_RETRY_SECONDS = 60
 
 
 RuntimeFactory = Callable[[str], Awaitable[UserRuntime] | UserRuntime]
@@ -457,6 +458,23 @@ async def daily_reset_supervisor() -> None:
         await asyncio.sleep(LOOP_RETRY_SECONDS)
 
 
+async def cleanup_supervisor() -> None:
+    """Delete old execution events for completed swaps once per hour."""
+    while True:
+        try:
+            deleted = await asyncio.to_thread(cleanup_old_execution_events)
+            if deleted:
+                print(
+                    f"[CLEANUP] Deleted {deleted} old execution event(s) "
+                    "for completed swaps."
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            print(f"[CLEANUP ERROR] {type(exc).__name__}: {exc}")
+        await asyncio.sleep(3600)
+
+
 async def wait_for_api_start(server: uvicorn.Server) -> bool:
     deadline = time.monotonic() + API_STARTUP_TIMEOUT_SECONDS
     while time.monotonic() < deadline:
@@ -499,6 +517,7 @@ async def main() -> None:
     server_task = asyncio.create_task(server.serve(), name="fastapi-server")
     monitor_task: Optional[asyncio.Task] = None
     daily_reset_task: Optional[asyncio.Task] = None
+    cleanup_task: Optional[asyncio.Task] = None
 
     try:
         if not await wait_for_api_start(server):
@@ -513,6 +532,9 @@ async def main() -> None:
         daily_reset_task = asyncio.create_task(
             daily_reset_supervisor(), name="daily-reset-supervisor"
         )
+        cleanup_task = asyncio.create_task(
+            cleanup_supervisor(), name="cleanup-supervisor"
+        )
         await server_task
 
     finally:
@@ -523,6 +545,10 @@ async def main() -> None:
         if daily_reset_task is not None:
             daily_reset_task.cancel()
             await asyncio.gather(daily_reset_task, return_exceptions=True)
+
+        if cleanup_task is not None:
+            cleanup_task.cancel()
+            await asyncio.gather(cleanup_task, return_exceptions=True)
 
         if monitor_task is not None:
             monitor_task.cancel()

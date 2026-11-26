@@ -128,14 +128,14 @@ MAX_SWAP_SIZE_CC = Decimal("102.0")
 POOL_MIN = Decimal("0.10")
 POOL_MAX = Decimal("0.17")
 DEFAULT_DAILY_LIMIT = 25
-POST_SWAP_COOLDOWN = 20
+POST_SWAP_COOLDOWN = 15
 RED_LIGHT_WAIT = 10      
 MIN_CC_BALANCE = Decimal("5.0") 
 
 PRICES_FILE = Path(__file__).parent / "prices.json"
 STATUS_FILE = Path(__file__).parent / "hunter_status.json"
 
-DISABLED_PAIR_COOLDOWN = 360
+DISABLED_PAIR_COOLDOWN = 240
 
 def _allowance_remaining(user_id):
     state = get_user_hunter_control_state(user_id)
@@ -373,10 +373,13 @@ async def check_and_swap(runtime: UserRuntime, client, instruments, sell_token, 
     }, runtime)
 
     if network_ok and pool_ok:
+        swap_succeeded = False
+        confirmed_tx_id = None
+
         async with execution_lock:
             print(f" CONDITIONS MET! Locking execution queue...")
             print(f" Details: {sell_amount_tokens} {sell_token} (~${total_usd_value:.2f} USD, {(sell_amount_tokens * cc_price):.2f} CC)")
-            
+
             start_time = time.perf_counter()
             try:
                 account_before = await client.get_account_info()
@@ -427,11 +430,9 @@ async def check_and_swap(runtime: UserRuntime, client, instruments, sell_token, 
                     )
                     return "PENDING_PAIR"
 
-                # verify=True is the approved operational signal.
                 end_time = time.perf_counter()
                 print(f"[SUBMISSION VERIFIED] tx_id={tx_id}; acknowledged in {end_time - start_time:.2f}s.")
-                
-                # Try to log the pending record, but don't crash if it fails.
+
                 try:
                     create_user_pending_swap(
                         runtime.user_id,
@@ -503,24 +504,12 @@ async def check_and_swap(runtime: UserRuntime, client, instruments, sell_token, 
                 runtime.net_cc_delta[sell_token] = runtime.net_cc_delta.get(sell_token, Decimal("0")) - (sell_amount_tokens * cc_price)
                 runtime.net_cc_delta[buy_token] = runtime.net_cc_delta.get(buy_token, Decimal("0")) + (sell_amount_tokens * cc_price)
 
-                await asyncio.sleep(POST_SWAP_COOLDOWN)
-                try:
-                    account_after = await client.get_account_info()
-                    print("[BALANCE REFRESH] Account snapshot refreshed after confirmed swap.")
-                except Exception as refresh_err:
-                    print(
-                        f"[BALANCE REFRESH DELAYED] Swap {tx_id} is confirmed and logged; "
-                        f"account snapshot will be retried on the next scan: {refresh_err}"
-                    )
+                swap_succeeded = True
+                confirmed_tx_id = tx_id
 
-                return True
             except Exception as e:
                 pair_id = pair_key or canonical_pair_key(sell_token, buy_token)
 
-                # Cantex's explicit disabled-token/pool response is a deterministic
-                # rejection. It is NOT an uncertain submission and must not create
-                # a pending transaction or trigger manual review. Hold only this
-                # pair for the agreed six-minute retry interval.
                 if _is_explicit_disabled_swap_rejection(e):
                     runtime.disabled_pairs[pair_id] = time.time() + DISABLED_PAIR_COOLDOWN
                     print(
@@ -530,14 +519,28 @@ async def check_and_swap(runtime: UserRuntime, client, instruments, sell_token, 
                     )
                     return "PAIR_COOLDOWN"
 
-                # All other submission/confirmation exceptions remain fail-safe:
-                # the outcome may be uncertain, so block this pair and request review.
                 runtime.pending_pairs.add(pair_id)
                 print(f"[SWAP OUTCOME UNCERTAIN] {e}. Blocking only {pair_id}; other pairs continue.")
                 await _notify_transaction_review(
                     runtime, reason=f"Swap submission/confirmation raised {type(e).__name__}; outcome is uncertain."
                 )
                 return "PENDING_PAIR"
+
+        # The per-user cooldown and balance refresh must not hold the global
+        # submission lock. Other users can submit while this user cools down.
+        if swap_succeeded:
+            await asyncio.sleep(POST_SWAP_COOLDOWN)
+            try:
+                await client.get_account_info()
+                print("[BALANCE REFRESH] Account snapshot refreshed after confirmed swap.")
+            except Exception as refresh_err:
+                print(
+                    f"[BALANCE REFRESH DELAYED] Swap {confirmed_tx_id} is confirmed and logged; "
+                    f"account snapshot will be retried on the next scan: {refresh_err}"
+                )
+            return True
+
+        return False
     else:
         return False
 
@@ -721,7 +724,7 @@ async def run_user(runtime: UserRuntime):
                     continue
                 if disabled_until:
                     runtime.disabled_pairs.pop(pair_key, None)
-                    print(f"{_user_tag(runtime)} [PAIR RETRY] {pair_key}: 360-second disabled-pair cooldown expired.")
+                    print(f"{_user_tag(runtime)} [PAIR RETRY] {pair_key}: {DISABLED_PAIR_COOLDOWN}-second disabled-pair cooldown expired.")
                 if pair_key in runtime.pending_pairs:
                     scan_stats["pending_pairs"] += 1
                     print(f"{_user_tag(runtime)} [PAIR PENDING] {pair_key}: unresolved submission; skipping this pair only.")

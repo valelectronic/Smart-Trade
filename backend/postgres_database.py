@@ -843,3 +843,55 @@ def get_user_rebate_history(user_id, limit=100, offset=0):
             return [dict(row) for row in cursor.fetchall()]
     finally:
         connection.close()
+
+def cleanup_old_execution_events(retention_hours: int = 24, batch_size: int = 500) -> int:
+    """Delete old execution-event rows only when their exact transaction is terminal.
+
+    Events without an explicit tx_id in payload (top-level or payload.data) are
+    deliberately retained. Events for PENDING/UNKNOWN or missing transactions
+    are also retained so cleanup cannot erase evidence needed for reconciliation.
+    """
+    if isinstance(retention_hours, bool) or not isinstance(retention_hours, int):
+        raise ValueError("retention_hours must be an integer")
+    if retention_hours < 1:
+        raise ValueError("retention_hours must be at least 1")
+    if isinstance(batch_size, bool) or not isinstance(batch_size, int):
+        raise ValueError("batch_size must be an integer")
+    if not 1 <= batch_size <= 10000:
+        raise ValueError("batch_size must be between 1 and 10000")
+
+    connection = get_connection()
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                WITH eligible AS (
+                    SELECT event.id
+                    FROM public.swap_execution_events AS event
+                    JOIN public.swap_transactions AS tx
+                      ON tx.user_id = event.user_id
+                     AND tx.tx_id = COALESCE(
+                         NULLIF(event.payload->>'tx_id', ''),
+                         NULLIF(event.payload->'data'->>'tx_id', '')
+                     )
+                    WHERE event.created_at < NOW() - (%s * INTERVAL '1 hour')
+                      AND tx.status IN ('SUCCESSFUL', 'FAILED')
+                    ORDER BY event.created_at ASC, event.id ASC
+                    LIMIT %s
+                    FOR UPDATE OF event SKIP LOCKED
+                )
+                DELETE FROM public.swap_execution_events AS event
+                USING eligible
+                WHERE event.id = eligible.id
+                """,
+                (retention_hours, batch_size),
+            )
+            deleted = cursor.rowcount
+        connection.commit()
+        return int(deleted)
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
+
