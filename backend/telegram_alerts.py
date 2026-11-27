@@ -63,7 +63,8 @@ async def send_daily_allowance_exhausted(user_id: str, daily_limit: int = 25) ->
         "DAILY TARGET COMPLETED\n"
         f"User: {user}\n"
         f"Completed {daily_limit}/{daily_limit} successful swaps today.\n"
-        "The Hunter has finished this account's daily target. No further swaps will be attempted until the daily reset."
+        "The Hunter has finished this account's daily target. No further swaps will be attempted until the daily reset.\n"
+        "Your Hunter rules have been cleared. Set new rules when you resume tomorrow."
     )
 
 

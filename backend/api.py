@@ -408,7 +408,6 @@ def get_hunter_history(
 @app.get("/api/hunter-daily-stats")
 def get_daily_stats(user=Depends(current_user)):
     try:
-        # The history query is user-scoped. Only today's UTC records are included.
         rows = get_user_rebate_history(user["id"], limit=1000, offset=0)
         from datetime import datetime, timezone
         today = datetime.now(timezone.utc).date()
@@ -417,11 +416,25 @@ def get_daily_stats(user=Depends(current_user)):
             if row.get("created_at") and row["created_at"].date() == today
         ]
 
-        total_net_fee = sum(float(row.get("network_fee") or 0) for row in todays_rows)
-        total_pool_fee_cc = sum(
-            float(row.get("sell_amount") or 0) * (float(row.get("pool_fee") or 0) / 100)
-            for row in todays_rows
-        )
+        prices_file = Path(__file__).resolve().parent / "prices.json"
+        cc_usd = 0.0
+        try:
+            if prices_file.exists():
+                prices = json.loads(prices_file.read_text(encoding="utf-8"))
+                cc_usd = float(prices.get("CC-USDC") or 0)
+        except (OSError, json.JSONDecodeError, ValueError):
+            cc_usd = 0.0
+
+        total_net_fee = 0.0
+        total_pool_fee_cc = 0.0
+        for row in todays_rows:
+            total_net_fee += float(row.get("network_fee") or 0)
+            usd_value = float(row.get("usd_value") or 0)
+            pool_fee_pct = float(row.get("pool_fee") or 0)
+            if cc_usd > 0 and usd_value > 0 and pool_fee_pct > 0:
+                cc_value = usd_value / cc_usd
+                total_pool_fee_cc += cc_value * (pool_fee_pct / 100)
+
         swap_count = get_user_today_swap_count(user["id"])
         estimated_rebate_cc = 23.4 * (swap_count / 25.0)
 

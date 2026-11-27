@@ -15,6 +15,7 @@ import asyncio
 import inspect
 import os
 import time
+from pathlib import Path
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Optional
 
@@ -23,12 +24,9 @@ import uvicorn
 from api import app
 from monitor_multiuser import run_monitor
 from postgres_database import (
-    clear_user_hunter_resume_intent,
     cleanup_old_execution_events,
-    get_user_hunter_control_state,
-    get_user_hunter_resume_intents,
+    delete_user_hunter_rules,
     init_db,
-    set_user_hunter_resume_intent,
 )
 from rebate_hunter import UserRuntime, run_user
 
@@ -39,8 +37,18 @@ PORT = int(os.getenv("PORT", "8000"))
 MAX_ACTIVE_HUNTERS = 5
 MONITOR_RETRY_SECONDS = 5
 API_STARTUP_TIMEOUT_SECONDS = 30
-CONTROL_STATE_RETRY_SECONDS = 60
-LOOP_RETRY_SECONDS = 60
+
+RULE_CHANGE_FILE = Path(__file__).resolve().parent / "hunter_rules_changed.flag"
+
+
+def signal_rule_change() -> None:
+    """Write the flag file the monitor watches for rule changes."""
+    try:
+        tmp = RULE_CHANGE_FILE.with_suffix(".tmp")
+        tmp.write_text(str(time.time_ns()), encoding="utf-8")
+        os.replace(tmp, RULE_CHANGE_FILE)
+    except Exception as exc:
+        print(f"[RULES SIGNAL WARNING] {exc}")
 
 
 RuntimeFactory = Callable[[str], Awaitable[UserRuntime] | UserRuntime]
@@ -69,13 +77,7 @@ class SlotManager:
         self.waiting: list[str] = []
         self._lock = asyncio.Lock()
         self._closing = False
-        # Users who reach the daily target remain eligible for automatic
-        # resumption on the next UTC date, unless they explicitly stop.
         self._daily_exhausted: set[str] = set()
-        self._daily_exhausted_on: dict[str, str] = {}
-        self._auto_resume_users: set[str] = set()
-        self._explicitly_stopped: set[str] = set()
-        self._resume_retry_after: dict[str, float] = {}
 
     def set_runtime_factory(self, factory: RuntimeFactory) -> None:
         """Register the secure per-user SDK/runtime factory."""
@@ -95,15 +97,7 @@ class SlotManager:
                     "Per-user runtime factory is not configured; no Hunter was started."
                 )
 
-            # A requested/queued Hunter must survive a process restart. A NULL
-            # exhausted_date means it is intended to be active, not waiting for
-            # the next UTC reset.
-            await asyncio.to_thread(set_user_hunter_resume_intent, user_id, None)
-            self._explicitly_stopped.discard(user_id)
-            self._auto_resume_users.add(user_id)
             self._daily_exhausted.discard(user_id)
-            self._daily_exhausted_on.pop(user_id, None)
-            self._resume_retry_after.pop(user_id, None)
 
             if len(self.active) < self.max_slots:
                 await self._start_locked(user_id)
@@ -155,70 +149,46 @@ class SlotManager:
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                # Preserve the durable intent, but avoid a rapid restart loop
-                # when credentials/network/runtime setup is temporarily failing.
-                self._resume_retry_after[user_id] = (
-                    time.monotonic() + CONTROL_STATE_RETRY_SECONDS
-                )
                 print(
                     f"[HUNTER ERROR] User {user_id}: "
-                    f"{type(exc).__name__}: {exc}; retry is delayed."
+                    f"{type(exc).__name__}: {exc}; releasing runtime."
                 )
                 return
 
             if isinstance(outcome, str) and outcome.startswith("DAILY_LIMIT_SLEEP:"):
-                # Persist the exhausted UTC date. The intent survives a Railway
-                # restart and is eligible only after the DB date rolls forward.
-                self._auto_resume_users.add(user_id)
                 self._daily_exhausted.add(user_id)
                 try:
-                    control_state = await asyncio.to_thread(
-                        get_user_hunter_control_state, user_id
+                    deleted = await asyncio.to_thread(
+                        delete_user_hunter_rules, user_id
                     )
-                    exhausted_date = str(control_state.get("daily_date") or "")
-                    await asyncio.to_thread(
-                        set_user_hunter_resume_intent,
-                        user_id,
-                        exhausted_date or None,
-                    )
-                    if exhausted_date:
-                        self._daily_exhausted_on[user_id] = exhausted_date
+                    if deleted:
+                        print(
+                            f"[SLOTS] Deleted {deleted} rule(s) "
+                            f"for exhausted user {user_id}."
+                        )
+                    signal_rule_change()
                 except Exception as exc:
-                    # Keep the persistent active intent if the exhaustion write
-                    # fails. The supervisor checks the DB allowance before restart.
                     print(
-                        f"[SLOTS] Could not persist daily exhaustion for {user_id}: "
-                        f"{type(exc).__name__}: {exc}"
+                        f"[SLOTS] Could not delete rules for {user_id}: {exc}"
                     )
                 print(f"[SLOTS] User {user_id} exhausted today's allowance.")
             elif outcome in ("HALTED_MANUAL_INTERVENTION", "NO_RULES"):
-                await asyncio.to_thread(clear_user_hunter_resume_intent, user_id)
-                self._auto_resume_users.discard(user_id)
                 self._daily_exhausted.discard(user_id)
-                self._daily_exhausted_on.pop(user_id, None)
                 print(f"[SLOTS] User {user_id} ended Hunter with status {outcome}.")
             elif outcome == "HALTED_CONTROL_STATE":
-                self._resume_retry_after[user_id] = (
-                    time.monotonic() + CONTROL_STATE_RETRY_SECONDS
-                )
                 print(
                     f"[SLOTS] User {user_id} could not read control state; "
-                    "releasing this runtime. The persisted intent will be retried."
+                    "releasing this runtime."
                 )
             elif outcome is False or outcome is None:
-                await asyncio.to_thread(clear_user_hunter_resume_intent, user_id)
-                self._auto_resume_users.discard(user_id)
                 print(
                     f"[SLOTS] User {user_id} run_user exited unexpectedly "
                     f"with {outcome!r}; releasing the runtime."
                 )
             else:
-                self._resume_retry_after[user_id] = (
-                    time.monotonic() + CONTROL_STATE_RETRY_SECONDS
-                )
                 print(
                     f"[SLOTS] User {user_id} ended with status {outcome!r}; "
-                    "releasing the runtime. A retry is delayed."
+                    "releasing the runtime."
                 )
         finally:
             # run_user's finally block closes its private event-reader task
@@ -261,14 +231,10 @@ class SlotManager:
                 continue
 
     async def release_slot(self, user_id: str, *, promote: bool = True) -> bool:
-        """Explicitly stop/dequeue a Hunter and permanently clear its resume intent."""
+        """Explicitly stop or dequeue a Hunter."""
         user_id = str(user_id)
         async with self._lock:
-            self._explicitly_stopped.add(user_id)
-            self._auto_resume_users.discard(user_id)
             self._daily_exhausted.discard(user_id)
-            self._daily_exhausted_on.pop(user_id, None)
-            self._resume_retry_after.pop(user_id, None)
             was_waiting = user_id in self.waiting
             if was_waiting:
                 self.waiting.remove(user_id)
@@ -276,10 +242,6 @@ class SlotManager:
             task = slot.task if slot is not None else None
             if task is not None:
                 task.cancel()
-
-        # Clear durable intent even when the user is already exhausted and has
-        # no active task. This is what prevents a restart from reviving a stop.
-        await asyncio.to_thread(clear_user_hunter_resume_intent, user_id)
 
         if task is not None:
             try:
@@ -303,102 +265,6 @@ class SlotManager:
         async with self._lock:
             user_id = str(user_id)
             self._daily_exhausted.discard(user_id)
-            self._daily_exhausted_on.pop(user_id, None)
-
-    async def resume_after_daily_reset(self) -> None:
-        """Restore persisted intents and resume only after a safe UTC rollover."""
-        intents = await asyncio.to_thread(get_user_hunter_resume_intents)
-
-        async with self._lock:
-            for intent in intents:
-                user_id = str(intent["user_id"])
-                if user_id in self._explicitly_stopped:
-                    continue
-                self._auto_resume_users.add(user_id)
-                exhausted_date = intent.get("exhausted_date")
-                if exhausted_date:
-                    self._daily_exhausted.add(user_id)
-                    self._daily_exhausted_on[user_id] = str(exhausted_date)
-                else:
-                    self._daily_exhausted.discard(user_id)
-                    self._daily_exhausted_on.pop(user_id, None)
-
-            candidates = [
-                user_id for user_id in self._auto_resume_users
-                if user_id not in self.active
-                and user_id not in self.waiting
-                and user_id not in self._explicitly_stopped
-                and time.monotonic() >= self._resume_retry_after.get(user_id, 0.0)
-            ]
-
-        for user_id in candidates:
-            try:
-                state = await asyncio.to_thread(
-                    get_user_hunter_control_state, user_id
-                )
-                current_date = str(state.get("daily_date") or "")
-                remaining = int(state.get("swaps_remaining", 0))
-                exhausted_date = self._daily_exhausted_on.get(user_id)
-
-                # A persistent manual lock always wins over an old resume intent.
-                if state.get("manual_intervention_required"):
-                    await asyncio.to_thread(
-                        clear_user_hunter_resume_intent, user_id
-                    )
-                    async with self._lock:
-                        self._auto_resume_users.discard(user_id)
-                        self._daily_exhausted.discard(user_id)
-                        self._daily_exhausted_on.pop(user_id, None)
-                    print(
-                        f"[SLOTS] Auto-resume withheld for {user_id}: "
-                        "manual intervention is required."
-                    )
-                    continue
-
-                if not current_date:
-                    continue
-
-                if remaining <= 0:
-                    # Covers a crash after the last successful swap but before
-                    # the exhaustion date was written. Never restart on 0 quota.
-                    if not exhausted_date:
-                        await asyncio.to_thread(
-                            set_user_hunter_resume_intent, user_id, current_date
-                        )
-                        async with self._lock:
-                            self._daily_exhausted.add(user_id)
-                            self._daily_exhausted_on[user_id] = current_date
-                    continue
-
-                # An exhausted Hunter waits for the DB's UTC date to advance.
-                if exhausted_date and current_date <= exhausted_date:
-                    continue
-
-                async with self._lock:
-                    if (
-                        user_id in self._explicitly_stopped
-                        or user_id in self.active
-                        or user_id in self.waiting
-                    ):
-                        continue
-                    self._daily_exhausted.discard(user_id)
-                    self._daily_exhausted_on.pop(user_id, None)
-
-                result = await self.request_slot(user_id)
-                print(
-                    f"[SLOTS] Daily reset/restart recovery for {user_id}: {result}."
-                )
-                async with self._lock:
-                    self._resume_retry_after.pop(user_id, None)
-            except Exception as exc:
-                async with self._lock:
-                    self._resume_retry_after[user_id] = (
-                        time.monotonic() + CONTROL_STATE_RETRY_SECONDS
-                    )
-                print(
-                    f"[SLOTS] Resume recovery failed for {user_id}: "
-                    f"{type(exc).__name__}: {exc}; will retry."
-                )
 
     async def shutdown(self) -> None:
         """Stop accepting requests and await all Hunter cleanup."""
@@ -444,18 +310,6 @@ async def monitor_supervisor() -> None:
         except Exception as exc:
             print(f"[MONITOR ERROR] {type(exc).__name__}: {exc}")
         await asyncio.sleep(MONITOR_RETRY_SECONDS)
-
-
-async def daily_reset_supervisor() -> None:
-    """Check UTC allowance rollover and resume eligible Hunters."""
-    while True:
-        try:
-            await slot_manager.resume_after_daily_reset()
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            print(f"[DAILY RESET ERROR] {type(exc).__name__}: {exc}")
-        await asyncio.sleep(LOOP_RETRY_SECONDS)
 
 
 async def cleanup_supervisor() -> None:
@@ -516,7 +370,6 @@ async def main() -> None:
     server = uvicorn.Server(server_config)
     server_task = asyncio.create_task(server.serve(), name="fastapi-server")
     monitor_task: Optional[asyncio.Task] = None
-    daily_reset_task: Optional[asyncio.Task] = None
     cleanup_task: Optional[asyncio.Task] = None
 
     try:
@@ -529,9 +382,6 @@ async def main() -> None:
         monitor_task = asyncio.create_task(
             monitor_supervisor(), name="multiuser-market-monitor"
         )
-        daily_reset_task = asyncio.create_task(
-            daily_reset_supervisor(), name="daily-reset-supervisor"
-        )
         cleanup_task = asyncio.create_task(
             cleanup_supervisor(), name="cleanup-supervisor"
         )
@@ -541,10 +391,6 @@ async def main() -> None:
         # Stop Hunter tasks first so each run_user finally block closes its
         # private WebSocket before the shared services are shut down.
         await slot_manager.shutdown()
-
-        if daily_reset_task is not None:
-            daily_reset_task.cancel()
-            await asyncio.gather(daily_reset_task, return_exceptions=True)
 
         if cleanup_task is not None:
             cleanup_task.cancel()

@@ -55,14 +55,10 @@ def init_db():
         "swap_execution_events": {
             "id", "user_id", "event_id", "event_type", "payload", "created_at",
         },
-        "hunter_resume_intents": {
-            "user_id", "auto_resume", "exhausted_date", "updated_at",
-        },
     }
     user_owned_tables = (
         "user_credentials", "hunter_control", "hunter_rules",
         "rebate_swaps", "swap_transactions", "swap_execution_events",
-        "hunter_resume_intents",
     )
 
     connection = get_connection()
@@ -134,8 +130,6 @@ def init_db():
                  "rebate_swaps must have UNIQUE (user_id, tx_id)"),
                 ("hunter_rules", "u", "UNIQUE (user_id, token_a, token_b)",
                  "hunter_rules must have UNIQUE (user_id, token_a, token_b)"),
-                ("hunter_resume_intents", "p", "PRIMARY KEY (user_id)",
-                 "hunter_resume_intents must have PRIMARY KEY (user_id)"),
             )
             for table, constraint_type, definition, message in expected_constraints:
                 cursor.execute(
@@ -151,22 +145,6 @@ def init_db():
                 )
                 if cursor.fetchone() is None:
                     problems.append(message)
-
-            cursor.execute(
-                """
-                SELECT 1
-                FROM pg_constraint
-                WHERE conrelid = 'public.hunter_resume_intents'::regclass
-                  AND contype = 'f'
-                  AND pg_get_constraintdef(oid) ILIKE
-                      'FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE'
-                LIMIT 1
-                """
-            )
-            if cursor.fetchone() is None:
-                problems.append(
-                    "hunter_resume_intents must reference users(id) with ON DELETE CASCADE"
-                )
 
             # Verify ownership foreign keys for every user-owned table.
             for table in user_owned_tables:
@@ -723,6 +701,31 @@ def delete_user_hunter_rule(user_id, rule_id: int):
     finally:
         connection.close()
 
+
+def delete_user_hunter_rules(user_id: str) -> int:
+    """Delete all of a user's Hunter rules after their daily limit is reached.
+
+    The user configures fresh rules when they manually resume after the
+    daily reset. Historical swaps in rebate_swaps are NOT touched, so
+    ping-pong restoration and accounting remain correct.
+    """
+    user_id = _require_user_id(user_id)
+    connection = get_connection()
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "DELETE FROM hunter_rules WHERE user_id = %s",
+                (user_id,),
+            )
+            deleted = cursor.rowcount
+        connection.commit()
+        return deleted
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
+
 def create_user_pending_swap(user_id, tx_id, sell_token, buy_token, sell_amount, submission_response=None, wallet_address=None, balance_snapshot=None):
     user_id = _require_user_id(user_id)
     tx_id = str(tx_id or '').strip()
@@ -845,12 +848,8 @@ def get_user_rebate_history(user_id, limit=100, offset=0):
         connection.close()
 
 def cleanup_old_execution_events(retention_hours: int = 24, batch_size: int = 500) -> int:
-    """Delete old execution-event rows only when their exact transaction is terminal.
+    """Delete execution-event rows older than the configured retention period."""
 
-    Events without an explicit tx_id in payload (top-level or payload.data) are
-    deliberately retained. Events for PENDING/UNKNOWN or missing transactions
-    are also retained so cleanup cannot erase evidence needed for reconciliation.
-    """
     if isinstance(retention_hours, bool) or not isinstance(retention_hours, int):
         raise ValueError("retention_hours must be an integer")
     if retention_hours < 1:
@@ -866,19 +865,12 @@ def cleanup_old_execution_events(retention_hours: int = 24, batch_size: int = 50
             cursor.execute(
                 """
                 WITH eligible AS (
-                    SELECT event.id
-                    FROM public.swap_execution_events AS event
-                    JOIN public.swap_transactions AS tx
-                      ON tx.user_id = event.user_id
-                     AND tx.tx_id = COALESCE(
-                         NULLIF(event.payload->>'tx_id', ''),
-                         NULLIF(event.payload->'data'->>'tx_id', '')
-                     )
-                    WHERE event.created_at < NOW() - (%s * INTERVAL '1 hour')
-                      AND tx.status IN ('SUCCESSFUL', 'FAILED')
-                    ORDER BY event.created_at ASC, event.id ASC
+                    SELECT id
+                    FROM public.swap_execution_events
+                    WHERE created_at < NOW() - (%s * INTERVAL '1 hour')
+                    ORDER BY created_at ASC, id ASC
                     LIMIT %s
-                    FOR UPDATE OF event SKIP LOCKED
+                    FOR UPDATE SKIP LOCKED
                 )
                 DELETE FROM public.swap_execution_events AS event
                 USING eligible
@@ -887,11 +879,13 @@ def cleanup_old_execution_events(retention_hours: int = 24, batch_size: int = 50
                 (retention_hours, batch_size),
             )
             deleted = cursor.rowcount
+
         connection.commit()
         return int(deleted)
+
     except Exception:
         connection.rollback()
         raise
+
     finally:
         connection.close()
-
